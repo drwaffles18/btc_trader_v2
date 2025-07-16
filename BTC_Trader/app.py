@@ -29,9 +29,25 @@ def load_data():
 
 df = load_data()
 
+# 🔍 Verificar si el dataframe tiene datos después del fetch
+st.subheader("Preview de Datos de Binance + Indicadores")
+st.dataframe(df.head())
+st.write("Dimensiones del dataframe después de indicadores:", df.shape)
+st.write("Columnas disponibles:", df.columns.tolist())
+
 # --- APLICAR MODELO BAYESIANO ---
 predictor = BayesSignalPredictor()
 df = predictor.predict_signals(df)
+
+# Verificar estado antes del modelo
+st.write("Antes del modelo - columnas presentes:", df.columns)
+st.write("¿Contiene 'B-H-S Signal' antes?", 'B-H-S Signal' in df.columns)
+
+df = predictor.predict_signals(df)
+
+# Verificar estado después del modelo
+st.write("Después del modelo - columnas presentes:", df.columns)
+st.write("Conteo de señales:", df['B-H-S Signal'].value_counts(dropna=False))
 
 # --- GRÁFICO DE SEÑALES ---
 st.markdown("### 2. Señales de Compra/Venta")
