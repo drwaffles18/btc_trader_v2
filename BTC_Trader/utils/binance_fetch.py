@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import pytz
 
 def get_binance_4h_data(symbol):
-    url = 'https://api.binance.com/api/v3/klines'
+    url = 'https://api.binance.us/api/v3/klines'
     params = {
         'symbol': symbol,
         'interval': '4h',
