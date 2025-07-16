@@ -21,36 +21,43 @@ INTERVAL = "4h"
 
 # --- CARGA DE DATOS ---
 st.markdown("### 1. Datos Binance y Cálculo de Indicadores")
-@st.cache_data(ttl=60*5)  # cache por 5 minutos
+
+@st.cache_data(ttl=60*5)
 def load_data():
-    df = get_binance_4h_data(SYMBOL)
-    df = calculate_indicators(df)
+    df_raw = get_binance_4h_data(SYMBOL)
+    st.subheader("🟡 Datos crudos de Binance")
+    st.dataframe(df_raw.head())
+    st.write("Dimensiones crudas:", df_raw.shape)
+
+    df = calculate_indicators(df_raw)
+    st.subheader("🟢 Datos con indicadores calculados")
+    st.dataframe(df.head())
+    st.write("Dimensiones después de indicadores:", df.shape)
+
     return df
 
 df = load_data()
 
-# 🔍 Verificar si el dataframe tiene datos después del fetch
-st.subheader("Preview de Datos de Binance + Indicadores")
-st.dataframe(df.head())
-st.write("Dimensiones del dataframe después de indicadores:", df.shape)
-st.write("Columnas disponibles:", df.columns.tolist())
+# Verificar columnas y estado general
+st.write("Columnas disponibles después de indicadores:", df.columns.tolist())
 
 # --- APLICAR MODELO BAYESIANO ---
-predictor = BayesSignalPredictor()
-df = predictor.predict_signals(df)
+st.markdown("### 2. Aplicar Modelo Bayesiano")
 
-# Verificar estado antes del modelo
+predictor = BayesSignalPredictor()
+
+# Verificar si columna de señales ya existe
 st.write("Antes del modelo - columnas presentes:", df.columns)
 st.write("¿Contiene 'B-H-S Signal' antes?", 'B-H-S Signal' in df.columns)
 
 df = predictor.predict_signals(df)
 
-# Verificar estado después del modelo
+# Verificar después de aplicar modelo
 st.write("Después del modelo - columnas presentes:", df.columns)
 st.write("Conteo de señales:", df['B-H-S Signal'].value_counts(dropna=False))
 
 # --- GRÁFICO DE SEÑALES ---
-st.markdown("### 2. Señales de Compra/Venta")
+st.markdown("### 3. Señales de Compra/Venta")
 fig = go.Figure()
 fig.add_trace(go.Candlestick(
     x=df['Open time'],
@@ -69,9 +76,8 @@ fig.update_layout(height=600, width=1100, title="BTC 4H + Señales Bayesianas")
 st.plotly_chart(fig, use_container_width=True)
 
 # --- EMBED DE TRADINGVIEW ---
-st.markdown("### 3. Visualización en TradingView (embed)")
+st.markdown("### 4. Visualización en TradingView (embed)")
 components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark" 
     width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
 """, height=500)
-
