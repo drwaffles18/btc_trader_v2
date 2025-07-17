@@ -1,31 +1,33 @@
 import pandas as pd
 
-def calcular_hit_rate(df, señal_col='B-H-S Signal', tiempo_col='Open time', precio_col='Close'):
+def calcular_estadisticas_modelo(df, señal_col='B-H-S Signal', precio_col='Close'):
     pares = []
-    last_buy_index = None
+    buy_price = None
 
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         señal = row[señal_col]
+        precio = row[precio_col]
 
-        # Ignorar valores NA
         if pd.isna(señal):
             continue
 
         if señal == 'B':
-            last_buy_index = idx
-        elif señal == 'S' and last_buy_index is not None:
-            buy_price = df.at[last_buy_index, precio_col]
-            sell_price = row[precio_col]
-
-            # Asegurarse de que no haya NA en los precios
-            if pd.notna(buy_price) and pd.notna(sell_price):
-                pares.append((buy_price, sell_price))
-
-            last_buy_index = None  # reiniciar para el siguiente par
+            buy_price = precio
+        elif señal == 'S' and buy_price is not None:
+            pares.append(precio - buy_price)
+            buy_price = None
 
     if not pares:
-        return 0.0, 0
+        return 0.0, 0, 0.0, 0.0, 0.0
 
-    hits = sum(1 for buy, sell in pares if sell > buy)
-    total = len(pares)
-    return hits / total * 100, total
+    pares = np.array(pares)
+    ganancias = pares[pares > 0]
+    perdidas = pares[pares <= 0]
+
+    hit_rate = 100 * len(ganancias) / len(pares)
+    ganancia_media = ganancias.mean() if len(ganancias) > 0 else 0.0
+    perdida_media = perdidas.mean() if len(perdidas) > 0 else 0.0
+    profit_factor = ganancias.sum() / abs(perdidas.sum()) if perdidas.sum() != 0 else np.inf
+
+    return hit_rate, len(pares), ganancia_media, perdida_media, profit_factor
+
