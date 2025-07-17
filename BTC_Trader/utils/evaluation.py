@@ -5,13 +5,23 @@ def calcular_hit_rate(df, señal_col='B-H-S Signal', tiempo_col='Open time', pre
     last_buy_index = None
 
     for idx, row in df.iterrows():
-        if row[señal_col] == 'B':
+        señal = row[señal_col]
+
+        # Ignorar valores NA
+        if pd.isna(señal):
+            continue
+
+        if señal == 'B':
             last_buy_index = idx
-        elif row[señal_col] == 'S' and last_buy_index is not None:
+        elif señal == 'S' and last_buy_index is not None:
             buy_price = df.at[last_buy_index, precio_col]
             sell_price = row[precio_col]
-            pares.append((buy_price, sell_price))
-            last_buy_index = None  # reset para siguiente par
+
+            # Asegurarse de que no haya NA en los precios
+            if pd.notna(buy_price) and pd.notna(sell_price):
+                pares.append((buy_price, sell_price))
+
+            last_buy_index = None  # reiniciar para el siguiente par
 
     if not pares:
         return 0.0, 0
