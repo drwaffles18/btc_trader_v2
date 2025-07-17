@@ -8,6 +8,7 @@ from utils.model_bayes import BayesSignalPredictor
 from utils.binance_fetch import get_binance_4h_data
 import streamlit.components.v1 as components
 from utils.signal_postprocessing import eliminar_señales_consecutivas
+from utils.evaluation import calcular_hit_rate
 
 # --- CONFIGURACION INICIAL ---
 st.set_page_config(page_title="BTC Streamlit V2.0", layout="wide")
@@ -34,6 +35,19 @@ df = predictor.predict_signals(df)
 
 # Eliminar señales Buy consecutivas
 df = eliminar_señales_consecutivas(df, columna='B-H-S Signal', señal='B')
+
+# Calcular Hit Rate
+hit_rate, total_pares = calcular_hit_rate(df)
+color_box = "#90EE90" if hit_rate >= 50 else "#FF7F7F"
+
+with st.container():
+    st.markdown(f"""
+        <div style="position: absolute; top: 30px; right: 40px; background-color: {color_box}; 
+                    padding: 12px 20px; border-radius: 10px; font-size: 18px;">
+            ✅ Hit Rate: <strong>{hit_rate:.1f}%</strong><br>
+            🔁 Total pares evaluados: {total_pares}
+        </div>
+    """, unsafe_allow_html=True)
 
 # --- GRÁFICO DE SEÑALES ---
 st.markdown("### 🟢 Señales de Compra/Venta")
