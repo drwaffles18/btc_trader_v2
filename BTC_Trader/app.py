@@ -73,6 +73,10 @@ st.write("📏 Filas antes del dropna:", df.shape[0])
 clean_df = df[required_columns].dropna()
 st.write("✅ Filas después del dropna (solo en columnas del modelo):", clean_df.shape[0])
 
+# Opcional: ver cuántas filas candidatas se enviarán al modelo
+candidatas = df[df['B-H-S Signal'].isna()].dropna(subset=required_columns)
+st.write("🔍 Filas candidatas a predecir por el modelo:", candidatas.shape)
+
 # --- APLICAR EL MODELO ---
 df = predictor.predict_signals(df)
 
