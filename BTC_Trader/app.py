@@ -1,3 +1,5 @@
+#app
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -73,10 +75,9 @@ st.write("📏 Filas antes del dropna:", df.shape[0])
 clean_df = df[required_columns].dropna()
 st.write("✅ Filas después del dropna (solo en columnas del modelo):", clean_df.shape[0])
 
-# Garantizar que la columna existe antes de inspeccionarla
+# Asegurar que la columna de señal exista antes del modelo
 if 'B-H-S Signal' not in df.columns:
     df['B-H-S Signal'] = np.nan
-
 
 # --- APLICAR EL MODELO ---
 df = predictor.predict_signals(df)
