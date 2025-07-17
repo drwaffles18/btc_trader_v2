@@ -43,10 +43,10 @@ class BayesSignalPredictor:
             df['B-H-S Signal'] = None
     
         data_to_predict = df[df['B-H-S Signal'].isna()].copy()
-        st.write("🔍 Filas candidatas a predecir:", data_to_predict.shape)
+        
     
         data_to_predict = data_to_predict.dropna()
-        st.write("🧹 Filas después de eliminar NaNs:", data_to_predict.shape)
+        
     
         if not data_to_predict.empty:
             prepared_data = self.prepare_data(data_to_predict)
