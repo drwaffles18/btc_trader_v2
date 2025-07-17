@@ -54,7 +54,11 @@ df = predictor.predict_signals(df)
 
 # Verificar después de aplicar modelo
 st.write("Después del modelo - columnas presentes:", df.columns)
-st.write("Conteo de señales:", df['B-H-S Signal'].value_counts(dropna=False))
+
+if 'B-H-S Signal' in df.columns and not df['B-H-S Signal'].dropna().empty:
+    st.write("Conteo de señales:", df['B-H-S Signal'].value_counts(dropna=False))
+else:
+    st.warning("⚠️ No se generaron señales bayesianas. Revisa si el dataframe está vacío o contiene valores nulos.")
 
 # --- GRÁFICO DE SEÑALES ---
 st.markdown("### 3. Señales de Compra/Venta")
