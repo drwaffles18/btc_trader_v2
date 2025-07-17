@@ -7,6 +7,7 @@ from utils.indicators import calculate_indicators
 from utils.model_bayes import BayesSignalPredictor
 from utils.binance_fetch import get_binance_4h_data
 import streamlit.components.v1 as components
+from utils.signal_postprocessing import eliminar_señales_consecutivas
 
 # --- CONFIGURACION INICIAL ---
 st.set_page_config(page_title="BTC Streamlit V2.0", layout="wide")
@@ -30,6 +31,9 @@ predictor = BayesSignalPredictor()
 if 'B-H-S Signal' not in df.columns:
     df['B-H-S Signal'] = np.nan
 df = predictor.predict_signals(df)
+
+# Eliminar señales Buy consecutivas
+df = eliminar_señales_consecutivas(df, columna='B-H-S Signal', señal='B')
 
 # --- GRÁFICO DE SEÑALES ---
 st.markdown("### 🟢 Señales de Compra/Venta")
