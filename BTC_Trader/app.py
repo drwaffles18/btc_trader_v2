@@ -40,18 +40,21 @@ df = eliminar_señales_consecutivas(df, columna='B-H-S Signal', señal='B')
 hit_rate, total_pares, ganancia_media, perdida_media, profit_factor = calcular_estadisticas_modelo(df)
 color_box = "#90EE90" if hit_rate >= 50 else "#FF7F7F"
 
-# Mostrar caja de resultados
-with st.container():
+# Mostrar caja de resultados - Versión alineada a la derecha (sin superposición)
+st.markdown("### 📊 Estadísticas del Modelo")
+col1, col2, col3 = st.columns([1, 1, 2])
+with col3:
     st.markdown(f"""
-        <div style="position: absolute; top: 30px; right: 40px; background-color: {color_box}; 
-                    padding: 12px 20px; border-radius: 10px; font-size: 16px;">
-            ✅ <strong>Hit Rate:</strong> {hit_rate:.1f}%<br>
-            🔁 <strong>Total pares:</strong> {total_pares}<br>
-            💰 <strong>Ganancia media:</strong> {ganancia_media:.2f}<br>
-            📉 <strong>Pérdida media:</strong> {perdida_media:.2f}<br>
-            📈 <strong>Profit Factor:</strong> {profit_factor:.2f}
-        </div>
+    <div style="background-color: {color_box}; 
+                padding: 12px 20px; border-radius: 10px; font-size: 16px;">
+        ✅ <strong>Hit Rate:</strong> {hit_rate:.1f}%<br>
+        🔁 <strong>Total pares:</strong> {total_pares}<br>
+        💰 <strong>Ganancia media:</strong> {ganancia_media:.2f}<br>
+        📉 <strong>Pérdida media:</strong> {perdida_media:.2f}<br>
+        📈 <strong>Profit Factor:</strong> {profit_factor:.2f}
+    </div>
     """, unsafe_allow_html=True)
+
 
 # --- GRÁFICO DE SEÑALES ---
 st.markdown("### 🟢 Señales de Compra/Venta")
