@@ -10,7 +10,7 @@ def get_binance_4h_data(symbol):
     params = {
         'symbol': symbol,
         'interval': '4h',
-        'limit': 500
+        'limit': 1000
     }
     response = requests.get(url, params=params)
     data = response.json()
