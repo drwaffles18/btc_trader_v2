@@ -41,15 +41,20 @@ class BayesSignalPredictor:
     def predict_signals(self, df):
         if 'B-H-S Signal' not in df.columns:
             df['B-H-S Signal'] = None
-
+    
         data_to_predict = df[df['B-H-S Signal'].isna()].copy()
-
-        # 🔒 Eliminar filas con NaNs antes de predecir
+        st.write("🔍 Filas candidatas a predecir:", data_to_predict.shape)
+    
         data_to_predict = data_to_predict.dropna()
-
+        st.write("🧹 Filas después de eliminar NaNs:", data_to_predict.shape)
+    
         if not data_to_predict.empty:
             prepared_data = self.prepare_data(data_to_predict)
+            st.write("📦 Datos listos para el modelo:", prepared_data.shape)
             predictions = self.model.predict(prepared_data)
             df.loc[data_to_predict.index, 'B-H-S Signal'] = predictions
-
+        else:
+            st.warning("⚠️ No hay datos suficientes para hacer predicción (NaNs o columnas faltantes).")
+    
         return df
+
