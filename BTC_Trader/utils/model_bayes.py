@@ -39,22 +39,24 @@ class BayesSignalPredictor:
         return df
 
     def predict_signals(self, df):
+        # Crear la columna si no existe
         if 'B-H-S Signal' not in df.columns:
-            df['B-H-S Signal'] = None
+            df['B-H-S Signal'] = np.nan
     
-        data_to_predict = df[df['B-H-S Signal'].isna()].copy()
-        
+        # Definir columnas requeridas
+        required_columns = ['EMA20', 'EMA50', 'EMA200', 'EMA_12', 'EMA_26', 'MACD', 'Signal_Line', 
+                            'RSI', '%K', '%D', 'MACD Comp', 'Cross Check', 'EMA20 Check', 
+                            'EMA 200 Check', 'RSI Check']
     
-        data_to_predict = data_to_predict.dropna()
-        
+        # Filtrar filas candidatas a predecir
+        candidatas = df[df['B-H-S Signal'].isna()].dropna(subset=required_columns)
+        print("✅ Filas después del dropna (solo en columnas del modelo):", candidatas.shape[0])
     
-        if not data_to_predict.empty:
-            prepared_data = self.prepare_data(data_to_predict)
-            st.write("📦 Datos listos para el modelo:", prepared_data.shape)
+        if not candidatas.empty:
+            prepared_data = self.prepare_data(candidatas)
             predictions = self.model.predict(prepared_data)
-            df.loc[data_to_predict.index, 'B-H-S Signal'] = predictions
-        else:
-            st.warning("⚠️ No hay datos suficientes para hacer predicción (NaNs o columnas faltantes).")
+            df.loc[candidatas.index, 'B-H-S Signal'] = predictions
     
         return df
+
 
