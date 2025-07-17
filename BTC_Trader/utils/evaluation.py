@@ -1,3 +1,6 @@
+# utils/evaluation.py
+
+import numpy as np
 import pandas as pd
 
 def calcular_estadisticas_modelo(df, señal_col='B-H-S Signal', precio_col='Close'):
@@ -30,4 +33,3 @@ def calcular_estadisticas_modelo(df, señal_col='B-H-S Signal', precio_col='Clos
     profit_factor = ganancias.sum() / abs(perdidas.sum()) if perdidas.sum() != 0 else np.inf
 
     return hit_rate, len(pares), ganancia_media, perdida_media, profit_factor
-
