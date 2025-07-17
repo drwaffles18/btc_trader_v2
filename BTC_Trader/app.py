@@ -1,5 +1,3 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -50,6 +48,32 @@ predictor = BayesSignalPredictor()
 st.write("Antes del modelo - columnas presentes:", df.columns)
 st.write("¿Contiene 'B-H-S Signal' antes?", 'B-H-S Signal' in df.columns)
 
+# --- VERIFICACIÓN DE COLUMNAS Y NULOS PREVIO A MODELO ---
+st.markdown("### 🧪 Verificación previa al modelo")
+
+required_columns = [
+    'EMA20', 'EMA50', 'EMA200', 'EMA_12', 'EMA_26',
+    'MACD', 'Signal_Line', 'RSI', '%K', '%D',
+    'MACD Comp', 'Cross Check', 'EMA20 Check', 'EMA 200 Check', 'RSI Check'
+]
+
+# Verificar columnas faltantes
+missing = [col for col in required_columns if col not in df.columns]
+if missing:
+    st.error(f"❌ Faltan columnas necesarias para el modelo: {missing}")
+else:
+    st.success("✅ Todas las columnas necesarias están presentes.")
+
+# Verificar NaNs por columna
+st.write("🔍 Conteo de NaNs por columna del modelo:")
+st.dataframe(df[required_columns].isna().sum().to_frame("NaNs"))
+
+# Verificar cuántas filas quedarían después del dropna
+st.write("📏 Filas antes del dropna:", df.shape[0])
+clean_df = df[required_columns].dropna()
+st.write("✅ Filas después del dropna (solo en columnas del modelo):", clean_df.shape[0])
+
+# --- APLICAR EL MODELO ---
 df = predictor.predict_signals(df)
 
 # Verificar después de aplicar modelo
