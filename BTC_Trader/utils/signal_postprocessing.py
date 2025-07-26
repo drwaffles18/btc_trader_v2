@@ -23,3 +23,21 @@ def eliminar_señales_consecutivas(df, columna='B-H-S Signal', señal='B'):
     df.loc[consecutivos, columna] = pd.NA
 
     return df
+
+def limpiar_señales_consecutivas(df, columna='Momentum Signal'):
+    """
+    Elimina señales consecutivas iguales propagando solo cambios de estado (ej: BUY seguido solo de SELL)
+    """
+    df = df.copy()
+    
+    # Solo dejamos los cambios (eliminamos señales consecutivas)
+    df['Signal Final'] = df[columna]
+    for i in range(1, len(df)):
+        if df.at[i, 'Signal Final'] == df.at[i-1, 'Signal Final']:
+            df.at[i, 'Signal Final'] = None
+
+    # Propagamos la última señal válida hacia adelante
+    df['Signal Final'] = df['Signal Final'].ffill()
+
+    return df
+
