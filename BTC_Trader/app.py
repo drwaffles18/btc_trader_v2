@@ -75,6 +75,58 @@ fig.add_trace(go.Scatter(x=sells['Open time'], y=sells['Low'], mode='markers',
 fig.update_layout(height=600, width=1100, title="BTC 4H + Señales Bayesianas")
 st.plotly_chart(fig, use_container_width=True)
 
+# --- GRÁFICO DE MOMENTUM INTEGRAL ---
+st.markdown("### 📉 Indicador de Momentum Integral")
+
+from utils.indicators import calcular_momentum_integral
+from datetime import timedelta
+
+# Calcular señal de momentum
+df_momentum = calcular_momentum_integral(df, window=6)
+
+fig_m = go.Figure()
+
+# Candlestick base
+fig_m.add_trace(go.Candlestick(
+    x=df_momentum['Open time'],
+    open=df_momentum['Open'], high=df_momentum['High'],
+    low=df_momentum['Low'], close=df_momentum['Close'],
+    name='Candlestick'))
+
+# Añadir señales del indicador de momentum
+for i, row in df_momentum.iterrows():
+    if row['Momentum Signal'] == 'BUY':
+        fig_m.add_trace(go.Scatter(
+            x=[row['Open time']], y=[row['Low']],
+            mode='text', text=["🟢BUY"],
+            textposition="bottom center", showlegend=False
+        ))
+        fig_m.add_vrect(
+            x0=row['Open time'],
+            x1=row['Open time'] + timedelta(hours=4),
+            fillcolor="green", opacity=0.15, line_width=0
+        )
+    elif row['Momentum Signal'] == 'SELL':
+        fig_m.add_trace(go.Scatter(
+            x=[row['Open time']], y=[row['High']],
+            mode='text', text=["🔴SELL"],
+            textposition="top center", showlegend=False
+        ))
+        fig_m.add_vrect(
+            x0=row['Open time'],
+            x1=row['Open time'] + timedelta(hours=4),
+            fillcolor="red", opacity=0.15, line_width=0
+        )
+
+fig_m.update_layout(
+    height=500,
+    width=1100,
+    title="Indicador de Momentum Integral (4h)",
+    showlegend=False
+)
+st.plotly_chart(fig_m, use_container_width=True)
+
+
 # --- EMBED DE TRADINGVIEW ---
 st.markdown("### 📊 Visualización en TradingView")
 components.html("""
