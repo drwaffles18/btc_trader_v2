@@ -11,6 +11,7 @@ from utils.signal_postprocessing import eliminar_señales_consecutivas
 from utils.evaluation import calcular_estadisticas_modelo
 from utils.signal_postprocessing import limpiar_señales_consecutivas
 from utils.indicators import calcular_momentum_integral
+from utils.evaluation import calcular_estadisticas_long_only
 
 
 # --- CONFIGURACION INICIAL ---
@@ -92,7 +93,7 @@ df_eval = df_momentum.copy()
 df_eval['Eval Signal'] = df_eval['Signal Final'].replace({'BUY': 'B', 'SELL': 'S'})
 
 
-hit_m, total_m, ganancia_m, perdida_m, pf_m = calcular_estadisticas_modelo(
+hit_m, total_m, ganancia_m, perdida_m, pf_m = calcular_estadisticas_long_only(
     df_eval, señal_col='Eval Signal', precio_col='Close'
 )
 
