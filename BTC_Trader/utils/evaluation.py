@@ -35,8 +35,14 @@ def calcular_estadisticas_modelo(df, señal_col='B-H-S Signal', precio_col='Clos
     return hit_rate, len(pares), ganancia_media, perdida_media, profit_factor
 
 def calcular_estadisticas_long_only(df, señal_col='Signal Final', precio_col='Close'):
+    """
+    Evalúa pares BUY → SELL secuenciales.
+    Solo cuenta trades largos. Ignora señales que no formen pares.
+    """
+    df = df.reset_index(drop=True)
     pares = []
-    buy_price = None
+    en_compra = False
+    precio_compra = None
 
     for _, row in df.iterrows():
         señal = row[señal_col]
@@ -45,12 +51,17 @@ def calcular_estadisticas_long_only(df, señal_col='Signal Final', precio_col='C
         if pd.isna(señal):
             continue
 
-        # Solo empieza con una compra
-        if señal in ['B', 'BUY']:
-            buy_price = precio
-        elif señal in ['S', 'SELL'] and buy_price is not None:
-            pares.append(precio - buy_price)
-            buy_price = None  # cerrar operación
+        if señal in ['B', 'BUY'] and not en_compra:
+            # Inicio de operación
+            precio_compra = precio
+            en_compra = True
+
+        elif señal in ['S', 'SELL'] and en_compra:
+            # Cierre de operación
+            ganancia = precio - precio_compra
+            pares.append(ganancia)
+            en_compra = False
+            precio_compra = None
 
     if not pares:
         return 0.0, 0, 0.0, 0.0, 0.0
