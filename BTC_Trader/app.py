@@ -9,6 +9,9 @@ from utils.binance_fetch import get_binance_4h_data
 import streamlit.components.v1 as components
 from utils.signal_postprocessing import eliminar_señales_consecutivas
 from utils.evaluation import calcular_estadisticas_modelo
+from utils.signal_postprocessing import limpiar_señales_consecutivas
+from utils.indicators import calcular_momentum_integral
+
 
 # --- CONFIGURACION INICIAL ---
 st.set_page_config(page_title="BTC Streamlit V2.0", layout="wide")
@@ -77,12 +80,14 @@ st.plotly_chart(fig, use_container_width=True)
 
 # --- GRÁFICO DE MOMENTUM INTEGRAL ---
 st.markdown("### 📉 Indicador de Momentum Integral")
+ultima = df_momentum['Signal Final'].iloc[-1]
+st.metric("Última Señal del Indicador", f"{ultima}")
 
-from utils.indicators import calcular_momentum_integral
-from datetime import timedelta
 
-# Calcular señal de momentum
+
+# Calcular señal de momentum y depurarla
 df_momentum = calcular_momentum_integral(df, window=6)
+df_momentum = limpiar_señales_consecutivas(df_momentum, columna='Momentum Signal')
 
 fig_m = go.Figure()
 
@@ -93,30 +98,35 @@ fig_m.add_trace(go.Candlestick(
     low=df_momentum['Low'], close=df_momentum['Close'],
     name='Candlestick'))
 
-# Añadir señales del indicador de momentum
+# Añadir SOLO los cambios de señal
 for i, row in df_momentum.iterrows():
-    if row['Momentum Signal'] == 'BUY':
-        fig_m.add_trace(go.Scatter(
-            x=[row['Open time']], y=[row['Low']],
-            mode='text', text=["🟢BUY"],
-            textposition="bottom center", showlegend=False
-        ))
-        fig_m.add_vrect(
-            x0=row['Open time'],
-            x1=row['Open time'] + timedelta(hours=4),
-            fillcolor="green", opacity=0.15, line_width=0
-        )
-    elif row['Momentum Signal'] == 'SELL':
-        fig_m.add_trace(go.Scatter(
-            x=[row['Open time']], y=[row['High']],
-            mode='text', text=["🔴SELL"],
-            textposition="top center", showlegend=False
-        ))
-        fig_m.add_vrect(
-            x0=row['Open time'],
-            x1=row['Open time'] + timedelta(hours=4),
-            fillcolor="red", opacity=0.15, line_width=0
-        )
+    # Detectar cambio de señal (solo cuando cambia respecto al anterior)
+    if i > 0:
+        actual = row['Signal Final']
+        anterior = df_momentum.at[i-1, 'Signal Final']
+        if actual != anterior:
+            if actual == 'BUY':
+                fig_m.add_trace(go.Scatter(
+                    x=[row['Open time']], y=[row['Low']],
+                    mode='text', text=["🟢BUY"],
+                    textposition="bottom center", showlegend=False
+                ))
+                fig_m.add_vrect(
+                    x0=row['Open time'],
+                    x1=row['Open time'] + timedelta(hours=4),
+                    fillcolor="green", opacity=0.15, line_width=0
+                )
+            elif actual == 'SELL':
+                fig_m.add_trace(go.Scatter(
+                    x=[row['Open time']], y=[row['High']],
+                    mode='text', text=["🔴SELL"],
+                    textposition="top center", showlegend=False
+                ))
+                fig_m.add_vrect(
+                    x0=row['Open time'],
+                    x1=row['Open time'] + timedelta(hours=4),
+                    fillcolor="red", opacity=0.15, line_width=0
+                )
 
 fig_m.update_layout(
     height=500,
