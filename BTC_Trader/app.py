@@ -88,9 +88,14 @@ st.markdown("### 📉 Indicador de Momentum Integral")
 df_momentum = calcular_momentum_integral(df, window=6)
 df_momentum = limpiar_señales_consecutivas(df_momentum, columna='Momentum Signal')
 
+df_eval = df_momentum.copy()
+df_eval['Eval Signal'] = df_eval['Signal Final'].replace({'BUY': 'B', 'SELL': 'S'})
+
+
 hit_m, total_m, ganancia_m, perdida_m, pf_m = calcular_estadisticas_modelo(
-    df_momentum, señal_col='Signal Final', precio_col='Close'
+    df_eval, señal_col='Eval Signal', precio_col='Close'
 )
+
 
 # Mostrar última señal con color y emoji
 ultima = df_momentum['Signal Final'].iloc[-1]
