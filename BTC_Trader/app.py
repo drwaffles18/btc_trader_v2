@@ -86,7 +86,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 # --- SIMULACIÓN DE CAPITAL FINAL ---
 st.markdown("### 💰 Simulación de Capital Final")
 
-capital_inicial = st.number_input("Capital inicial ($)", min_value=1000, value=10000, step=500)
+capital_inicial = st.number_input("Capital inicial ($)", min_value=1, value=100, step=500)
 capital_final = simular_capital_long_only(df_eval, capital_inicial, señal_col='Eval Signal', precio_col='Close')
 
 st.success(f"📈 Capital final estimado: ${capital_final:,.2f}")
