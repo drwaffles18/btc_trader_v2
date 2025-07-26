@@ -8,6 +8,7 @@ from utils.binance_fetch import get_binance_4h_data
 from utils.signal_postprocessing import limpiar_señales_consecutivas
 from utils.evaluation import calcular_estadisticas_long_only
 import streamlit.components.v1 as components
+from utils.evaluation import simular_capital_long_only
 
 # --- CONFIGURACION INICIAL ---
 st.set_page_config(page_title="BTC Streamlit V2.0", layout="wide")
@@ -28,6 +29,31 @@ df = load_data()
 # --- CALCULAR MOMENTUM INTEGRAL ---
 df_momentum = calcular_momentum_integral(df, window=6)
 df_momentum = limpiar_señales_consecutivas(df_momentum, columna='Momentum Signal')
+
+# --- MOSTRAR ÚLTIMA SEÑAL ---
+ultima = df_momentum['Signal Final'].iloc[-1]
+if ultima == 'BUY':
+    color = '#90EE90'
+    emoji = '🟢'
+elif ultima == 'SELL':
+    color = '#FF7F7F'
+    emoji = '🔴'
+else:
+    color = '#D3D3D3'
+    emoji = '⏸️'
+
+st.markdown(f"""
+<div style="background-color: {color}; 
+            padding: 12px 20px; 
+            border-radius: 10px; 
+            font-size: 16px;
+            text-align: center;">
+    📌 <strong>Última Señal del Indicador:</strong> {emoji} {ultima}
+</div>
+""", unsafe_allow_html=True)
+
+# 🔻 SEPARADOR VISUAL ENTRE SECCIONES
+st.markdown("<br>", unsafe_allow_html=True)
 
 # --- EVALUACIÓN ---
 df_eval = df_momentum.copy()
@@ -54,27 +80,17 @@ with col3:
     </div>
     """, unsafe_allow_html=True)
 
-# --- MOSTRAR ÚLTIMA SEÑAL ---
-ultima = df_momentum['Signal Final'].iloc[-1]
-if ultima == 'BUY':
-    color = '#90EE90'
-    emoji = '🟢'
-elif ultima == 'SELL':
-    color = '#FF7F7F'
-    emoji = '🔴'
-else:
-    color = '#D3D3D3'
-    emoji = '⏸️'
+# 🔻 SEPARADOR VISUAL
+st.markdown("<br>", unsafe_allow_html=True)
 
-st.markdown(f"""
-<div style="background-color: {color}; 
-            padding: 12px 20px; 
-            border-radius: 10px; 
-            font-size: 16px;
-            text-align: center;">
-    📌 <strong>Última Señal del Indicador:</strong> {emoji} {ultima}
-</div>
-""", unsafe_allow_html=True)
+# --- SIMULACIÓN DE CAPITAL FINAL ---
+st.markdown("### 💰 Simulación de Capital Final")
+
+capital_inicial = st.number_input("Capital inicial ($)", min_value=1000, value=10000, step=500)
+capital_final = simular_capital_long_only(df_eval, capital_inicial, señal_col='Eval Signal', precio_col='Close')
+
+st.success(f"📈 Capital final estimado: ${capital_final:,.2f}")
+
 
 # --- GRÁFICO MOMENTUM INTEGRAL ---
 st.markdown("### 📉 Indicador de Momentum Integral")
