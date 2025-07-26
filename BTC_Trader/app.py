@@ -88,6 +88,10 @@ st.markdown("### 📉 Indicador de Momentum Integral")
 df_momentum = calcular_momentum_integral(df, window=6)
 df_momentum = limpiar_señales_consecutivas(df_momentum, columna='Momentum Signal')
 
+hit_m, total_m, ganancia_m, perdida_m, pf_m = calcular_estadisticas_modelo(
+    df_momentum, señal_col='Signal Final', precio_col='Close'
+)
+
 # Mostrar última señal con color y emoji
 ultima = df_momentum['Signal Final'].iloc[-1]
 
@@ -158,6 +162,23 @@ fig_m.update_layout(
     showlegend=False
 )
 st.plotly_chart(fig_m, use_container_width=True)
+
+color_m = "#90EE90" if hit_m >= 50 else "#FF7F7F"
+
+st.markdown("### 📊 Estadísticas del Indicador Momentum Integral")
+col4, col5, col6 = st.columns([1, 1, 2])
+with col6:
+    st.markdown(f"""
+    <div style="background-color: {color_m}; 
+                padding: 12px 20px; border-radius: 10px; font-size: 16px;">
+        ✅ <strong>Hit Rate:</strong> {hit_m:.1f}%<br>
+        🔁 <strong>Total pares:</strong> {total_m}<br>
+        💰 <strong>Ganancia media:</strong> {ganancia_m:.2f}<br>
+        📉 <strong>Pérdida media:</strong> {perdida_m:.2f}<br>
+        📈 <strong>Profit Factor:</strong> {pf_m:.2f}
+    </div>
+    """, unsafe_allow_html=True)
+
 
 
 # --- EMBED DE TRADINGVIEW ---
