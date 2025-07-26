@@ -78,16 +78,39 @@ fig.add_trace(go.Scatter(x=sells['Open time'], y=sells['Low'], mode='markers',
 fig.update_layout(height=600, width=1100, title="BTC 4H + Señales Bayesianas")
 st.plotly_chart(fig, use_container_width=True)
 
+
+##🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴##
+
 # --- GRÁFICO DE MOMENTUM INTEGRAL ---
 st.markdown("### 📉 Indicador de Momentum Integral")
-ultima = df_momentum['Signal Final'].iloc[-1]
-st.metric("Última Señal del Indicador", f"{ultima}")
-
-
 
 # Calcular señal de momentum y depurarla
 df_momentum = calcular_momentum_integral(df, window=6)
 df_momentum = limpiar_señales_consecutivas(df_momentum, columna='Momentum Signal')
+
+# Mostrar última señal con color y emoji
+ultima = df_momentum['Signal Final'].iloc[-1]
+
+if ultima == 'BUY':
+    color = '#90EE90'  # verde claro
+    emoji = '🟢'
+elif ultima == 'SELL':
+    color = '#FF7F7F'  # rojo claro
+    emoji = '🔴'
+else:
+    color = '#D3D3D3'  # gris
+    emoji = '⏸️'
+
+st.markdown(f"""
+<div style="background-color: {color}; 
+            padding: 12px 20px; 
+            border-radius: 10px; 
+            font-size: 16px;
+            text-align: center;">
+    📌 <strong>Última Señal del Indicador:</strong> {emoji} {ultima}
+</div>
+""", unsafe_allow_html=True)
+
 
 fig_m = go.Figure()
 
