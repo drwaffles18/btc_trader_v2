@@ -42,3 +42,20 @@ def calculate_indicators(df):
     df['EMA 200 Check'] = (df['Close'] > df['EMA200']).astype(int)
     df['RSI Check'] = ((df['%K'] < 90) & (df['%D'] < 90)).astype(int)
     return df
+def calcular_momentum_integral(df, window=6):
+    df = df.copy()
+    df['momentum'] = df['Close'].diff()
+    df['integral_momentum'] = df['momentum'].rolling(window=window).sum()
+    df['slope_integral'] = df['integral_momentum'].diff()
+    std_slope = df['slope_integral'].rolling(window=window).std()
+
+    df['Momentum Signal'] = np.where(
+        (df['slope_integral'] < -std_slope) & (df['momentum'] < 0),
+        'SELL',
+        np.where(
+            (df['slope_integral'] > std_slope) & (df['momentum'] > 0),
+            'BUY',
+            None
+        )
+    )
+    return df
