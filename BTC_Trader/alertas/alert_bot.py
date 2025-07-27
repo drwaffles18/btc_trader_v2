@@ -1,9 +1,14 @@
+import os
+import sys
+import requests
+
+# Agregar el path raíz para poder importar utils correctamente
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from utils.indicators import calculate_indicators, calcular_momentum_integral
 from utils.signal_postprocessing import limpiar_señales_consecutivas
 from utils.binance_fetch import get_binance_4h_data
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
-import requests
-import os
 
 # Token y chat ID desde variables de entorno
 TOKEN = os.getenv("TELEGRAM_TOKEN")
