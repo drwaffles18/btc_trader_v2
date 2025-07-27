@@ -59,3 +59,14 @@ def calcular_momentum_integral(df, window=6):
         )
     )
     return df
+
+def calcular_momentum_integral_ajustado(df, window=6, umbral=0.005):
+    df['Momentum'] = df['Close'].diff(window)
+    df['Momentum Change'] = df['Momentum'].diff()
+
+    df['Signal Final'] = 'None'
+    df.loc[df['Momentum Change'] > umbral, 'Signal Final'] = 'BUY'
+    df.loc[df['Momentum Change'] < -umbral, 'Signal Final'] = 'SELL'
+
+    return df
+
