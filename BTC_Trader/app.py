@@ -7,7 +7,7 @@ import streamlit.components.v1 as components
 # --- IMPORTACIONES PERSONALIZADAS ---
 from utils.indicators import calculate_indicators, calcular_momentum_integral
 from utils.binance_fetch import get_binance_4h_data
-from utils.signal_postprocessing import limpiar_seales_consecutivas
+from utils.signal_postprocessing import limpiar_señales_consecutivas
 
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Cripto Señales Multi-Token", layout="wide")
