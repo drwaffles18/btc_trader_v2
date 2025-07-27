@@ -3,12 +3,18 @@ from utils.signal_postprocessing import limpiar_señales_consecutivas
 from utils.binance_fetch import get_binance_4h_data
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 import requests
+import os
 
 # Token y chat ID (ya definidos)
-TOKEN = "8376556528:AAElgljnyZ9DbBXBIPuLEKxkaZdbp-j8j38"
-CHAT_ID = 7575887942
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+print(f"🔔 Enviando señal: {mensaje}")
 
 def enviar_mensaje_telegram(mensaje):
+    if not TOKEN or not CHAT_ID:
+        print("❌ ERROR: TOKEN o CHAT_ID no definidos")
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
