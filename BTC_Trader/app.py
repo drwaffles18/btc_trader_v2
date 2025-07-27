@@ -11,7 +11,7 @@ from utils.signal_postprocessing import limpiar_señales_consecutivas
 
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Cripto Señales Multi-Token", layout="wide")
-st.title("📊 Señales Automatizadas de Momentum por Token")
+st.title("📊 Señales Automatizadas por Token")
 
 # --- PARÁMETROS ---
 symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT"]
@@ -100,7 +100,7 @@ for symbol in symbols:
     fig.update_layout(
         height=500,
         width=1100,
-        title=f"Señales Momentum Integral - {symbol}",
+        title=f"Señales Últimos 30 Días - {symbol}",
         showlegend=False,
         xaxis_rangeslider_visible=False,
         template="plotly_dark"
