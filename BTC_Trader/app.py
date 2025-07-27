@@ -61,15 +61,21 @@ st.markdown("### 📊 Gráficos de Señales por Token")
 
 for symbol in symbols:
     df = procesar_symbol(symbol)
+
+    # Filtrar solo señales de los últimos 30 días
+    fecha_limite = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=30)
+    df_ultimos_30 = df[df['Open time'] >= fecha_limite]
+
     fig = go.Figure()
 
+    # Velas completas (puedes filtrar también si quieres solo los últimos 30 días)
     fig.add_trace(go.Candlestick(
         x=df['Open time'],
         open=df['Open'], high=df['High'],
         low=df['Low'], close=df['Close'],
         name='Candlestick'))
 
-    for i, row in df.iterrows():
+    for i, row in df_ultimos_30.iterrows():
         if i > 0:
             actual = row['Signal Final']
             anterior = df.at[i-1, 'Signal Final']
