@@ -22,7 +22,7 @@ def procesar_symbol(symbol):
     df = get_binance_4h_data(symbol)
     df = calculate_indicators(df)
     df = calcular_momentum_integral(df, window=6)
-    df = limpiar_seales_consecutivas(df, columna='Momentum Signal')
+    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')
     df['Signal Final'] = df['Momentum Signal']
     return df
 
