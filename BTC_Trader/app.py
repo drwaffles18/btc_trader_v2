@@ -62,20 +62,22 @@ st.markdown("### 📊 Gráficos de Señales por Token")
 for symbol in symbols:
     df = procesar_symbol(symbol)
 
-    # Filtrar solo señales de los últimos 30 días
+    # Filtrar solo datos de los últimos 30 días
     fecha_limite = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=30)
-    df_ultimos_30 = df[df['Open time'] >= fecha_limite]
+    df['Open time naive'] = df['Open time'].dt.tz_localize(None)
+    df_filtrado = df[df['Open time naive'] >= fecha_limite]
 
     fig = go.Figure()
 
-    # Velas completas (puedes filtrar también si quieres solo los últimos 30 días)
+    # Velas SOLO de los últimos 30 días
     fig.add_trace(go.Candlestick(
-        x=df['Open time'],
-        open=df['Open'], high=df['High'],
-        low=df['Low'], close=df['Close'],
+        x=df_filtrado['Open time'],
+        open=df_filtrado['Open'], high=df_filtrado['High'],
+        low=df_filtrado['Low'], close=df_filtrado['Close'],
         name='Candlestick'))
 
-    for i, row in df_ultimos_30.iterrows():
+    # Añadir banderas de señales de los últimos 30 días
+    for i, row in df_filtrado.iterrows():
         if i > 0:
             actual = row['Signal Final']
             anterior = df.at[i-1, 'Signal Final']
@@ -105,6 +107,7 @@ for symbol in symbols:
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
 
 # --- EMBED DE TRADINGVIEW ---
 st.markdown("### 📊 Visualización en TradingView (BTCUSDT)")
