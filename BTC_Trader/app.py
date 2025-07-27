@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import timedelta
 import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
+
 
 # --- IMPORTACIONES PERSONALIZADAS ---
 from utils.indicators import calculate_indicators, calcular_momentum_integral
@@ -11,7 +13,11 @@ from utils.signal_postprocessing import limpiar_señales_consecutivas
 
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Cripto Señales Multi-Token", layout="wide")
+
 st.title("📊 Señales Automatizadas por Token")
+
+# 🔄 Refrescar cada 10 minutos (600,000 ms)
+st_autorefresh(interval=600000, key="auto_refresh")
 
 # --- PARÁMETROS ---
 symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT"]
