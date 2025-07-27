@@ -36,17 +36,21 @@ for symbol in symbols:
     fecha_ultima = ultima_fila['Open time']
 
     if ultima_senal == 'BUY':
-        color = '#90EE90'
+        color = '#90EE90'  # verde claro
         emoji = '🟢'
+        texto_color = '#000000'  # negro
     elif ultima_senal == 'SELL':
-        color = '#FF7F7F'
+        color = '#FF7F7F'  # rojo claro
         emoji = '🔴'
+        texto_color = '#FFFFFF'  # blanco
     else:
-        color = '#D3D3D3'
+        color = '#D3D3D3'  # gris claro
         emoji = '⏸️'
+        texto_color = '#000000'  # negro
 
     st.markdown(f"""
     <div style="background-color: {color}; 
+                color: {texto_color};
                 padding: 10px 18px; 
                 border-radius: 10px; 
                 font-size: 16px; 
@@ -55,6 +59,7 @@ for symbol in symbols:
         🗓️ <strong>Fecha:</strong> {fecha_ultima}
     </div>
     """, unsafe_allow_html=True)
+
 
 # --- MOSTRAR LOS 4 GRÁFICOS ---
 st.markdown("### 📊 Gráficos de Señales por Token")
