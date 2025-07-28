@@ -8,7 +8,7 @@ import requests
 #sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Agregar el path raíz para poder importar utils correctamente
-#sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.indicators import calculate_indicators, calcular_momentum_integral
 from utils.signal_postprocessing import limpiar_señales_consecutivas
