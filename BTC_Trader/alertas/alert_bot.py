@@ -3,6 +3,10 @@ import sys
 import requests
 from utils.trading_executor import ejecutar_operacion
 
+print("🛠️ PATH del script:", os.path.dirname(__file__))
+print("🧭 Agregando a sys.path:", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 # Agregar el path raíz para poder importar utils correctamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
