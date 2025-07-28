@@ -1,6 +1,7 @@
 import os
 import sys
 import requests
+from utils.trading_executor import ejecutar_operacion
 
 # Agregar el path raíz para poder importar utils correctamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -58,6 +59,8 @@ def main():
                 mensaje = f"{emoji} NUEVA SEÑAL para {symbol}:\n📍 {señal}\n🕒 {fecha}"
                 print(f"📢 Enviando: {mensaje}")
                 enviar_mensaje_telegram(mensaje)
+                # 🔁 Ejecutar trade automáticamente
+                ejecutar_operacion(symbol, señal, estado_anterior.get(symbol))
             else:
                 print(f"⏭️ No hay nueva señal para {symbol} ({señal})")
 
