@@ -1,6 +1,9 @@
 import os
 import sys
 import requests
+from datetime import datetime, timezone
+import pandas as pd
+
 #from utils.trading_executor import ejecutar_operacion
 
 #print("🛠️ PATH del script:", os.path.dirname(__file__))
@@ -52,7 +55,16 @@ def main():
     for symbol in symbols:
         try:
             df = procesar_symbol(symbol)
+            # Obtener última fila
             ultima = df.dropna(subset=['Signal Final']).iloc[-1]
+            
+            # Verificar si la vela está cerrada
+            hora_actual = datetime.now(timezone.utc)
+            hora_ultima_vela = ultima['Open time'] + pd.Timedelta(hours=4)
+            
+            if hora_actual < hora_ultima_vela:
+                print(f"⏳ La vela de {symbol} aún no está cerrada. Saltando.")
+                continue
             señal = ultima['Signal Final']
             fecha = ultima['Open time']
 
