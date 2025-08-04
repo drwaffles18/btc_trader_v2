@@ -98,15 +98,13 @@ for symbol in symbols:
                         x=[row['Open time']], y=[row['Low']],
                         mode='text', text=["🟢BUY"],
                         textposition="bottom center", showlegend=False))
-                    fig.add_vrect(x0=row['Open time'], x1=row['Open time'] + timedelta(hours=4),
-                                  fillcolor="green", opacity=0.15, line_width=0)
+                    
                 elif actual == 'SELL':
                     fig.add_trace(go.Scatter(
                         x=[row['Open time']], y=[row['High']],
                         mode='text', text=["🔴SELL"],
                         textposition="top center", showlegend=False))
-                    fig.add_vrect(x0=row['Open time'], x1=row['Open time'] + timedelta(hours=4),
-                                  fillcolor="red", opacity=0.15, line_width=0)
+                    
 
     fig.update_layout(
         height=500,
@@ -126,3 +124,4 @@ components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark" 
     width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
 """, height=500)
+
