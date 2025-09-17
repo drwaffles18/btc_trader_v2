@@ -2,23 +2,31 @@
 # Este módulo extrae velas 4H de Binance
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-import pytz
 
 def get_binance_4h_data(symbol):
-    url = 'https://api.binance.us/api/v3/klines'
+    # Usar el endpoint global (no .us) para disponer de todos los pares
+    url = 'https://api.binance.com/api/v3/klines'
     params = {
         'symbol': symbol,
         'interval': '4h',
         'limit': 1000
     }
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
     data = response.json()
-    df = pd.DataFrame(data, columns=[
+
+    cols = [
         'Open time', 'Open', 'High', 'Low', 'Close', 'Volume',
         'Close time', 'Quote asset volume', 'Number of trades',
-        'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore']
-    )
+        'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'
+    ]
+    df = pd.DataFrame(data, columns=cols)
+
+    # Tiempos como tz-aware (Costa Rica) para que comparaciones funcionen bien
     df['Open time'] = pd.to_datetime(df['Open time'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('America/Costa_Rica')
-    df[['Open', 'High', 'Low', 'Close']] = df[['Open', 'High', 'Low', 'Close']].astype(float)
+
+    # Numéricos
+    for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+
     return df
