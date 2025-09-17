@@ -4,12 +4,6 @@ import requests
 from datetime import datetime, timezone
 import pandas as pd
 
-#from utils.trading_executor import ejecutar_operacion
-
-#print("🛠️ PATH del script:", os.path.dirname(__file__))
-#print("🧭 Agregando a sys.path:", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-#sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 # Agregar el path raíz para poder importar utils correctamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -27,11 +21,8 @@ def enviar_mensaje_telegram(mensaje):
         print("❌ ERROR: TOKEN o CHAT_ID no definidos")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": mensaje
-    }
-    response = requests.post(url, data=payload)
+    payload = {"chat_id": CHAT_ID, "text": mensaje}
+    response = requests.post(url, data=payload, timeout=20)
     if response.status_code == 200:
         print("✅ Mensaje enviado correctamente")
     else:
@@ -42,41 +33,46 @@ def procesar_symbol(symbol):
     df = get_binance_4h_data(symbol)
     df = calculate_indicators(df)
     df = calcular_momentum_integral(df, window=6)
-    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')
-    df['Signal Final'] = df['Momentum Signal']
+    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')  # crea/actualiza 'Signal Final'
     return df
 
 def main():
     print("🚀 Iniciando verificación de señales...")
-    symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT"]
+    symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]  # <-- BNB agregado
     estado_anterior = cargar_estado_anterior()
     estado_actual = {}
 
     for symbol in symbols:
         try:
             df = procesar_symbol(symbol)
-            # Obtener última fila
-            ultima = df.dropna(subset=['Signal Final']).iloc[-1]
-            
-            # Verificar si la vela está cerrada
+
+            df_valid = df.dropna(subset=['Signal Final'])
+            if df_valid.empty:
+                print(f"ℹ️ Sin señales válidas para {symbol} todavía.")
+                continue
+
+            ultima = df_valid.iloc[-1]
+
+            # Verificar si la vela está cerrada (4h después del Open time)
             hora_actual = datetime.now(timezone.utc)
             hora_ultima_vela = ultima['Open time'] + pd.Timedelta(hours=4)
-            
-            if hora_actual < hora_ultima_vela:
+
+            if hora_actual < hora_ultima_vela.tz_convert('UTC'):
                 print(f"⏳ La vela de {symbol} aún no está cerrada. Saltando.")
                 continue
+
             señal = ultima['Signal Final']
             fecha = ultima['Open time']
+            precio = float(ultima['Close'])
 
             estado_actual[symbol] = señal
 
             if estado_anterior.get(symbol) != señal and señal in ['BUY', 'SELL']:
                 emoji = "🟢" if señal == "BUY" else "🔴"
-                mensaje = f"{emoji} NUEVA SEÑAL para {symbol}:\n📍 {señal}\n🕒 {fecha}"
+                mensaje = f"{emoji} NUEVA SEÑAL para {symbol}:\n📍 {señal}\n💵 Precio: {precio:,.4f}\n🕒 {fecha}"
                 print(f"📢 Enviando: {mensaje}")
                 enviar_mensaje_telegram(mensaje)
-                # 🔁 Ejecutar trade automáticamente
-                #ejecutar_operacion(symbol, señal, estado_anterior.get(symbol))
+                # ejecutar_operacion(symbol, señal, estado_anterior.get(symbol))  # si lo activas
             else:
                 print(f"⏭️ No hay nueva señal para {symbol} ({señal})")
 
