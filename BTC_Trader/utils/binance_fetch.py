@@ -1,5 +1,5 @@
 # utils/binance_fetch.py
-# Fetch de velas 4h con routing por símbolo + fallback controlado y cache de host exitoso
+# Fetch de velas 4h SOLO con mirror público y binance.us (sin globales) + logging
 
 import os
 import requests
@@ -7,16 +7,12 @@ import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Hosts configurables por ENV (puedes cambiarlos en Railway sin tocar código)
-US_HOST   = (os.getenv("BINANCE_US_URL") or "https://api.binance.us").rstrip("/")
-MIRROR    = (os.getenv("BINANCE_MIRROR_URL") or "https://data-api.binance.vision").rstrip("/")
-G1        = (os.getenv("BINANCE_BASE_URL") or "https://api1.binance.com").rstrip("/")
-G2        = "https://api2.binance.com"
-G3        = "https://api3.binance.com"
+US_HOST = (os.getenv("BINANCE_US_URL") or "https://api.binance.us").rstrip("/")
+MIRROR  = (os.getenv("BINANCE_MIRROR_URL") or "https://data-api.binance.vision").rstrip("/")
 
-# OJO: XRP/BNB típicamente no están en .us → mandarlos a mirror/global
-US_SYMBOLS   = {"BTCUSDT", "ETHUSDT", "ADAUSDT"}  # NO XRP, NO BNB
-MIRROR_FIRST = {"BNBUSDT", "XRPUSDT"}             # estos intentan mirror sí o sí
+# Símbolos que normalmente están en .US (ajusta si quieres)
+US_SYMBOLS   = {"BTCUSDT", "ETHUSDT", "ADAUSDT"}   # XRP/BNB usualmente no
+MIRROR_FIRST = {"BNBUSDT", "XRPUSDT"}               # estos primero al MIRROR
 
 _HEADERS = {"User-Agent": "VictorTradingApp/1.0 (+railway)"}
 
@@ -32,44 +28,46 @@ _adapter = HTTPAdapter(max_retries=_retry)
 _session.mount("http://", _adapter)
 _session.mount("https://", _adapter)
 
-# Cache en memoria: host que funcionó por símbolo
+# Cache: host que funcionó por símbolo
 _PREFERRED_BASE = {}
+
+def _bases_for(symbol: str):
+    # orden por símbolo (sin globales)
+    if symbol in MIRROR_FIRST:
+        return [MIRROR, US_HOST]
+    elif symbol in US_SYMBOLS:
+        return [MIRROR, US_HOST]
+    else:
+        return [MIRROR, US_HOST]
 
 def _fetch_klines(base: str, symbol: str, interval: str, limit: int, timeout: int = 12):
     url = f"{base}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = _session.get(url, params=params, timeout=timeout, headers=_HEADERS)
-    # 451/403 = geobloqueo/legal; no reintentar en el mismo host
+    # 451/403 = bloqueos → saltar a siguiente base
     if r.status_code in (451, 403):
         raise requests.HTTPError(f"{r.status_code} from {base}", response=r)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, list):
-        # Respuesta de error JSON (dict) → no sirve para DF
         raise ValueError(f"Formato inesperado desde {base}: {data}")
     return data
 
-def _bases_for(symbol: str):
-    # Siempre probar MIRROR primero: evita 451 y suele ser rápido
-    if symbol in MIRROR_FIRST:
-        return [MIRROR, US_HOST, G1, G2, G3]
-    elif symbol in US_SYMBOLS:
-        return [MIRROR, US_HOST, G1, G2, G3]
-    else:
-        return [MIRROR, US_HOST, G1, G2, G3]
-
 def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
     """
-    Descarga velas 4h para 'symbol'. Intenta en orden de bases adecuado y
-    memoriza el host que funcionó para ese símbolo (durante el ciclo de vida del proceso).
+    Descarga velas 4h desde MIRROR/.US solamente.
+    Memoriza el host exitoso por símbolo y loguea los intentos.
     """
-    limit = max(50, min(int(limit), 1000))  # clamp
+    limit = max(50, min(int(limit), 1000))
+    bases = _bases_for(symbol)
 
-    # Si ya sabemos qué host funciona para este símbolo, úsalo directo
-    base_hint = _PREFERRED_BASE.get(symbol)
-    bases = [base_hint] + _bases_for(symbol) if base_hint else _bases_for(symbol)
+    # hint de host preferido
+    hint = _PREFERRED_BASE.get(symbol)
+    if hint and hint in bases:
+        bases = [hint] + [b for b in bases if b != hint]
 
     last_exc = None
+    print(f"[binance_fetch] {symbol} → probando bases en orden: {bases}")
     for base in [b for b in bases if b]:
         try:
             data = _fetch_klines(base, symbol, "4h", limit)
@@ -79,19 +77,20 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
                 "Taker buy base asset volume","Taker buy quote asset volume","Ignore"
             ]
             df = pd.DataFrame(data, columns=cols)
-            # Tiempos tz-aware a Costa Rica
             df["Open time"] = pd.to_datetime(df["Open time"], unit="ms")\
                                  .tz_localize("UTC").tz_convert("America/Costa_Rica")
             df = df.sort_values("Open time").reset_index(drop=True)
             for c in ["Open","High","Low","Close","Volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # Memoriza el host exitoso para próximas llamadas
             _PREFERRED_BASE[symbol] = base
+            print(f"[binance_fetch] {symbol} ✓ usando base: {base}")
             return df
 
         except Exception as e:
+            print(f"[binance_fetch] {symbol} ✗ fallo con {base}: {e}")
             last_exc = e
             continue
 
+    # falló todo
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
