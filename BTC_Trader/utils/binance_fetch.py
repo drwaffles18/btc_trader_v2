@@ -11,8 +11,8 @@ US_HOST = (os.getenv("BINANCE_US_URL") or "https://api.binance.us").rstrip("/")
 MIRROR  = (os.getenv("BINANCE_MIRROR_URL") or "https://data-api.binance.vision").rstrip("/")
 
 # Símbolos que normalmente están en .US (ajusta si quieres)
-US_SYMBOLS   = {"BTCUSDT", "ETHUSDT", "ADAUSDT"}   # XRP/BNB usualmente no
-MIRROR_FIRST = {"BNBUSDT", "XRPUSDT"}               # estos primero al MIRROR
+US_SYMBOLS   = {"BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT"}   # sin BNB que esta en Mirror
+MIRROR_FIRST = {"BNBUSDT"}               # estos primero al MIRROR
 
 _HEADERS = {"User-Agent": "VictorTradingApp/1.0 (+railway)"}
 
@@ -77,8 +77,11 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
                 "Taker buy base asset volume","Taker buy quote asset volume","Ignore"
             ]
             df = pd.DataFrame(data, columns=cols)
-            df["Open time"] = pd.to_datetime(df["Open time"], unit="ms")\
-                                 .tz_localize("UTC").tz_convert("America/Costa_Rica")
+            
+            df["Open time"] = pd.to_datetime(df["Open time"], unit="ms", utc=True) \
+                     .dt.tz_convert("America/Costa_Rica")
+
+            
             df = df.sort_values("Open time").reset_index(drop=True)
             for c in ["Open","High","Low","Close","Volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -94,3 +97,4 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
 
     # falló todo
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
+
