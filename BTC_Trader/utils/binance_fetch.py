@@ -99,13 +99,19 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
             ]
             df = pd.DataFrame(data, columns=cols)
 
-            # Convierte a hora local CR para visualización
-            df["Open time"] = pd.to_datetime(df["Open time"], unit="ms", utc=True) \
-                                .dt.tz_convert("America/Costa_Rica")
-
-            df = df.sort_values("Open time").reset_index(drop=True)
+            # 1) Numéricos primero
             for c in ["Open","High","Low","Close","Volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # 2) Tiempos: crear UTC desde ms
+            df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
+            df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
+
+            # 3) Derivar hora local (CR) para visualización
+            df["Open time"] = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
+
+            # 4) Ordenar por tiempo (usa UTC para evitar confusiones)
+            df = df.sort_values("Open time UTC").reset_index(drop=True)
 
             _PREFERRED_BASE[symbol] = base
             print(f"[binance_fetch] {symbol} ✓ usando base: {base}")
@@ -118,6 +124,7 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
 
     # falló todo
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
+
 
 # =========================
 # NUEVO: pedir EXPLÍCITAMENTE la ÚLTIMA vela 4h CERRADA (UTC)
@@ -168,3 +175,4 @@ def fetch_last_closed_kline(symbol: str, base_url: str, session=None):
     # hint de base preferida al tener éxito
     _PREFERRED_BASE[symbol] = base_url
     return k, last_open, last_close, server_time_ms
+
