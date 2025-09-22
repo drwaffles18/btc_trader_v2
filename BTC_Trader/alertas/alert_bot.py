@@ -1,4 +1,6 @@
 # alertas/alertas_bot.py
+# Bot de Telegram para enviar señales con Entrada, SL por swing y TPs (1.0%, 1.5%, 1.75%)
+# Usa solo la ÚLTIMA vela 4H CERRADA (UTC) y evita look-ahead.
 
 import os
 import sys
@@ -16,6 +18,7 @@ from utils.binance_fetch import (
     fetch_last_closed_kline,
     bases_para,
 )
+from utils.risk_levels import build_levels, format_signal_msg
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 # Token y chat ID desde variables de entorno
@@ -28,11 +31,14 @@ def enviar_mensaje_telegram(mensaje: str):
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje}
-    response = requests.post(url, data=payload, timeout=20)
-    if response.status_code == 200:
-        print("✅ Mensaje enviado correctamente")
-    else:
-        print(f"⚠️ Error al enviar mensaje: {response.text}")
+    try:
+        response = requests.post(url, data=payload, timeout=20)
+        if response.status_code == 200:
+            print("✅ Mensaje enviado correctamente")
+        else:
+            print(f"⚠️ Error al enviar mensaje: {response.text}")
+    except Exception as e:
+        print(f"⚠️ Excepción enviando mensaje a Telegram: {e}")
 
 def _last_closed_for(symbol: str):
     """
@@ -61,7 +67,24 @@ def procesar_symbol(symbol: str) -> pd.DataFrame:
 
 def main():
     print("🚀 Iniciando verificación de señales...")
-    symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]  # <-- BNB agregado
+    # Puedes ajustar esta lista por env: SYMBOLS="BTCUSDT,ETHUSDT,ADAUSDT,XRPUSDT,BNBUSDT"
+    env_symbols = os.getenv("SYMBOLS")
+    if env_symbols:
+        symbols = [s.strip().upper() for s in env_symbols.split(",") if s.strip()]
+    else:
+        symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]  # default
+
+    # Parámetros de niveles (ajustables por env)
+    # SL method: "window" (simple) o "fractal" (más estricto). Ventana por defecto=5 velas.
+    SL_METHOD = os.getenv("SL_METHOD", "window").lower()  # "window" | "fractal"
+    SL_WINDOW = int(os.getenv("SL_WINDOW", "5"))
+    SL_LEFT   = int(os.getenv("SL_LEFT", "2"))
+    SL_RIGHT  = int(os.getenv("SL_RIGHT", "2"))
+    ATR_K     = float(os.getenv("ATR_K", "0.0"))  # margen ATR opcional, ej. 0.2
+
+    # TPs en %
+    TP_PERCENTS = [float(x) for x in os.getenv("TP_PERCENTS", "1.0,1.5,1.75").split(",")]
+
     estado_anterior = cargar_estado_anterior()
     estado_actual = {}
 
@@ -96,7 +119,7 @@ def main():
             # 4) Señal SOLO de la vela cerrada
             señal = fila.get('Signal Final', None)
             precio = float(fila.get('Close', float('nan')))
-            fecha_cr = fila.get('Open time')  # en CR (bonito para mostrar)
+            fecha_cr = fila.get('Open time')  # en CR (string/ts bonito para mostrar)
 
             # 5) Registrar estado como ya hacías (almacena la señal actual)
             estado_actual[symbol] = señal
@@ -104,14 +127,37 @@ def main():
             # 6) Envío a Telegram (si hay señal y cambió)
             if señal in ['BUY', 'SELL']:
                 if estado_anterior.get(symbol) != señal:
-                    emoji = "🟢" if señal == "BUY" else "🔴"
-                    mensaje = (
-                        f"{emoji} NUEVA SEÑAL para {symbol}:\n"
-                        f"📍 {señal}\n"
-                        f"💵 Precio: {precio:,.4f}\n"
-                        f"🕒 {fecha_cr} (CR)\n"
-                        f"🔗 base: {base}"
+                    # ----- NUEVO: SL/TPs -----
+                    # Recortar DF hasta la vela cerrada para evitar look-ahead
+                    df_recorte = df[df["Open time UTC"] <= last_open_utc].copy()
+
+                    # Validar columnas necesarias
+                    for col in ["High", "Low", "Close"]:
+                        if col not in df_recorte.columns:
+                            raise RuntimeError(f"Falta columna {col} para calcular SL/TP en {symbol}")
+
+                    # Construir niveles (parámetros ajustables por env)
+                    levels = build_levels(
+                        df=df_recorte,
+                        side=señal,
+                        entry=precio,
+                        tp_percents=TP_PERCENTS,
+                        sl_method=SL_METHOD,  # "window" o "fractal"
+                        window=SL_WINDOW,
+                        left=SL_LEFT,
+                        right=SL_RIGHT,
+                        atr_k=ATR_K           # ej. 0.2 para despegar SL del swing
                     )
+
+                    # Mensaje enriquecido
+                    mensaje = format_signal_msg(
+                        symbol=symbol,
+                        side=señal,
+                        levels=levels,
+                        ts_local_str=str(fecha_cr),
+                        source_url=base
+                    )
+
                     print(f"📢 Enviando: {mensaje}")
                     enviar_mensaje_telegram(mensaje)
                 else:
