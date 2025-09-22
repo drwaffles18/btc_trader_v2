@@ -1,5 +1,7 @@
 # alertas/alertas_bot.py
-# Bot de Telegram para enviar señales con Entrada, SL por swing y TPs (1.0%, 1.5%, 1.75%)
+# Bot de Telegram para enviar señales:
+# - BUY: mensaje enriquecido con Entrada, SL (swing) y TPs (1.0%, 1.5%, 1.75%) + R:R
+# - SELL: mensaje simple (como antes)
 # Usa solo la ÚLTIMA vela 4H CERRADA (UTC) y evita look-ahead.
 
 import os
@@ -67,15 +69,14 @@ def procesar_symbol(symbol: str) -> pd.DataFrame:
 
 def main():
     print("🚀 Iniciando verificación de señales...")
-    # Puedes ajustar esta lista por env: SYMBOLS="BTCUSDT,ETHUSDT,ADAUSDT,XRPUSDT,BNBUSDT"
+    # Lista de símbolos configurable por env
     env_symbols = os.getenv("SYMBOLS")
     if env_symbols:
         symbols = [s.strip().upper() for s in env_symbols.split(",") if s.strip()]
     else:
         symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]  # default
 
-    # Parámetros de niveles (ajustables por env)
-    # SL method: "window" (simple) o "fractal" (más estricto). Ventana por defecto=5 velas.
+    # Parámetros para niveles (solo aplican para BUY)
     SL_METHOD = os.getenv("SL_METHOD", "window").lower()  # "window" | "fractal"
     SL_WINDOW = int(os.getenv("SL_WINDOW", "5"))
     SL_LEFT   = int(os.getenv("SL_LEFT", "2"))
@@ -104,7 +105,6 @@ def main():
                 try:
                     ms_series = (df["Open time UTC"].astype("int64") // 1_000_000)
                 except Exception:
-                    # Fallback alterno, por si cambia el dtype en alguna versión
                     ms_series = (df["Open time UTC"].view("int64") // 1_000_000)
 
                 df["_delta_ms"] = ms_series - last_open_ms
@@ -127,39 +127,52 @@ def main():
             # 6) Envío a Telegram (si hay señal y cambió)
             if señal in ['BUY', 'SELL']:
                 if estado_anterior.get(symbol) != señal:
-                    # ----- NUEVO: SL/TPs -----
-                    # Recortar DF hasta la vela cerrada para evitar look-ahead
-                    df_recorte = df[df["Open time UTC"] <= last_open_utc].copy()
 
-                    # Validar columnas necesarias
-                    for col in ["High", "Low", "Close"]:
-                        if col not in df_recorte.columns:
-                            raise RuntimeError(f"Falta columna {col} para calcular SL/TP en {symbol}")
+                    if señal == 'BUY':
+                        # ===== BUY: mensaje enriquecido con SL/TPs =====
+                        # Recortar DF hasta la vela cerrada para evitar look-ahead
+                        df_recorte = df[df["Open time UTC"] <= last_open_utc].copy()
 
-                    # Construir niveles (parámetros ajustables por env)
-                    levels = build_levels(
-                        df=df_recorte,
-                        side=señal,
-                        entry=precio,
-                        tp_percents=TP_PERCENTS,
-                        sl_method=SL_METHOD,  # "window" o "fractal"
-                        window=SL_WINDOW,
-                        left=SL_LEFT,
-                        right=SL_RIGHT,
-                        atr_k=ATR_K           # ej. 0.2 para despegar SL del swing
-                    )
+                        # Validar columnas necesarias
+                        for col in ["High", "Low", "Close"]:
+                            if col not in df_recorte.columns:
+                                raise RuntimeError(f"Falta columna {col} para calcular SL/TP en {symbol}")
 
-                    # Mensaje enriquecido
-                    mensaje = format_signal_msg(
-                        symbol=symbol,
-                        side=señal,
-                        levels=levels,
-                        ts_local_str=str(fecha_cr),
-                        source_url=base
-                    )
+                        # Construir niveles
+                        levels = build_levels(
+                            df=df_recorte,
+                            side='BUY',
+                            entry=precio,
+                            tp_percents=TP_PERCENTS,
+                            sl_method=SL_METHOD,  # "window" o "fractal"
+                            window=SL_WINDOW,
+                            left=SL_LEFT,
+                            right=SL_RIGHT,
+                            atr_k=ATR_K           # ej. 0.2 para despegar SL del swing
+                        )
+
+                        # Mensaje enriquecido
+                        mensaje = format_signal_msg(
+                            symbol=symbol,
+                            side='BUY',
+                            levels=levels,
+                            ts_local_str=str(fecha_cr),
+                            source_url=base
+                        )
+
+                    else:
+                        # ===== SELL: mensaje simple (como antes) =====
+                        emoji = "🔴"
+                        mensaje = (
+                            f"{emoji} NUEVA SEÑAL para {symbol}:\n"
+                            f"📍 SELL\n"
+                            f"💵 Precio: {precio:,.4f}\n"
+                            f"🕒 {fecha_cr} (CR)\n"
+                        )
 
                     print(f"📢 Enviando: {mensaje}")
                     enviar_mensaje_telegram(mensaje)
+
                 else:
                     print(f"⏭️ {symbol} señal repetida ({señal}) en la última vela cerrada. No se reenvía.")
             else:
