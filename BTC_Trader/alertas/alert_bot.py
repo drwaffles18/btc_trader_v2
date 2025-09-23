@@ -24,7 +24,7 @@ from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Ventana de gracia (min) SOLO para re-ENVIOS tardíos de una vela ya registrada
+# Ventana de gracia (min) ABSOLUTA: bloquea cualquier envío tardío (aunque no haya estado previo)
 GRACE_MINUTES = int(os.getenv("GRACE_MINUTES", "15"))
 
 def enviar_mensaje_telegram(mensaje: str):
@@ -89,13 +89,14 @@ def main():
             prev_signal = prev.get("signal")
             prev_close  = prev.get("last_close_ms", 0)
 
-            # 3) Gracia CONDICIONAL: si ya registramos esta vela y estamos tarde, no reenviar
+            # 3) Gracia ABSOLUTA: si la vela cerró hace demasiado tiempo, NO enviar nada.
             if GRACE_MINUTES > 0:
                 delta_ms = server_ms - last_close_ms
-                print(f"[{symbol}] Δ(server_ms - last_close_ms) = {delta_ms} ms (grace={GRACE_MINUTES}m) | prev_close={prev_close}")
-                if (prev_close == last_close_ms) and (delta_ms > (GRACE_MINUTES * 60 * 1000)):
-                    print(f"⏭️ [{symbol}] fuera de ventana de gracia y la vela ya estaba registrada → no envío.")
-                    estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
+                print(f"[{symbol}] Δ(server_ms - last_close_ms) = {delta_ms} ms (grace={GRACE_MINUTES}m)")
+                if delta_ms > (GRACE_MINUTES * 60 * 1000):
+                    print(f"⏭️ [{symbol}] vela cerrada hace más de {GRACE_MINUTES}m → no envío señal atrasada.")
+                    # Registramos igual la vela para no reevaluarla en el próximo cron
+                    estado_actual[symbol] = {"signal": None, "last_close_ms": last_close_ms}
                     continue
 
             # 4) Descarga histórico ALINEADO a la MISMA base
@@ -108,8 +109,7 @@ def main():
             df = calculate_indicators(df)
             df = calcular_momentum_integral(df, window=6)
 
-            # 6) Señal “limpia” como en el chart (propagada); NO se usa sola para disparar,
-            #     sino para detectar TRANSICIÓN (cambio de tramo) igual que en la app.
+            # 6) Señal “limpia” como en el chart (propagada) para detectar TRANSICIÓN
             df_clean = limpiar_señales_consecutivas(df, columna='Momentum Signal')
             df['Signal Final'] = df_clean['Signal Final']
 
@@ -148,12 +148,18 @@ def main():
 
             # 9) Emular el gráfico: disparar SOLO si hay TRANSICIÓN de Signal Final
             #    (primera vela del nuevo tramo BUY/SELL)
-            #    Buscamos la fila previa en df_clean por índice
+            #    Localizamos la fila previa en df_clean de forma robusta
             try:
                 idx = df_clean.index.get_loc(fila.name)
             except Exception:
-                # Fallback robusto si el index difiere: localizar por timestamp
-                idx = df_clean.index[df_clean["Open time UTC"] == fila["Open time UTC"]][0]
+                mask_ts = (df_clean["Open time UTC"] == fila["Open time UTC"])
+                if not mask_ts.any():
+                    print(f"[{symbol}] ⚠️ No pude localizar la fila en df_clean por timestamp; no se dispara señal.")
+                    estado_actual[symbol] = {"signal": None, "last_close_ms": last_close_ms}
+                    continue
+                # obtener el índice posicional de la primera coincidencia
+                idx = df_clean.index.get_indexer_for(df_clean.index[mask_ts])[0]
+
             prev_clean = df_clean.iloc[idx-1]['Signal Final'] if idx > 0 else None
             curr_clean = prop_signal
 
