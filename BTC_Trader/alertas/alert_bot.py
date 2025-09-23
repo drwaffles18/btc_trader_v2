@@ -1,6 +1,6 @@
 # alertas/alertas_bot.py
 # Bot de Telegram para enviar señales:
-# - BUY: mensaje enriquecido con Entrada, SL (swing) y TPs (1.0%, 1.5%, 1.75%) + R:R
+# - BUY: mensaje enriquecido con Entrada, SL (swing) y TPs por R:R (1.0x, 1.5x, 1.75x)
 # - SELL: mensaje simple (como antes)
 # Usa solo la ÚLTIMA vela 4H CERRADA (UTC) y evita look-ahead.
 
@@ -8,7 +8,7 @@ import os
 import sys
 import requests
 import pandas as pd
-from datetime import timezone
+# from datetime import timezone  # <- no se usa, lo puedes eliminar
 
 # Agregar el path raíz para poder importar utils correctamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -83,8 +83,8 @@ def main():
     SL_RIGHT  = int(os.getenv("SL_RIGHT", "2"))
     ATR_K     = float(os.getenv("ATR_K", "0.0"))  # margen ATR opcional, ej. 0.2
 
-    # TPs en %
-    TP_PERCENTS = [float(x) for x in os.getenv("TP_PERCENTS", "1.0,1.5,1.75").split(",")]
+    # RR targets (múltiplos de riesgo)
+    RR_TARGETS = [float(x) for x in os.getenv("RR_TARGETS", "1.0,1.5,1.75").split(",")]
 
     estado_anterior = cargar_estado_anterior()
     estado_actual = {}
@@ -138,17 +138,17 @@ def main():
                             if col not in df_recorte.columns:
                                 raise RuntimeError(f"Falta columna {col} para calcular SL/TP en {symbol}")
 
-                        # Construir niveles
+                        # Construir niveles (R:R)
                         levels = build_levels(
                             df=df_recorte,
                             side='BUY',
                             entry=precio,
-                            tp_percents=TP_PERCENTS,
-                            sl_method=SL_METHOD,  # "window" o "fractal"
+                            rr_targets=RR_TARGETS,   # múltiplos de riesgo (1.0x, 1.5x, 1.75x)
+                            sl_method=SL_METHOD,
                             window=SL_WINDOW,
                             left=SL_LEFT,
                             right=SL_RIGHT,
-                            atr_k=ATR_K           # ej. 0.2 para despegar SL del swing
+                            atr_k=ATR_K
                         )
 
                         # Mensaje enriquecido
@@ -168,6 +168,7 @@ def main():
                             f"📍 SELL\n"
                             f"💵 Precio: {precio:,.4f}\n"
                             f"🕒 {fecha_cr} (CR)\n"
+                            f"🔗 base: {base}"
                         )
 
                     print(f"📢 Enviando: {mensaje}")
