@@ -8,7 +8,6 @@ import os
 import sys
 import requests
 import pandas as pd
-# from datetime import timezone  # <- no se usa, lo puedes eliminar
 
 # Agregar el path raíz para poder importar utils correctamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -55,18 +54,6 @@ def _last_closed_for(symbol: str):
             print(f"[{symbol}] fallo confirmando última cerrada en {base}: {e}")
     raise RuntimeError(f"[{symbol}] No se pudo confirmar la última vela cerrada en ninguna base.")
 
-def procesar_symbol(symbol: str) -> pd.DataFrame:
-    """
-    Descarga histórico 4H, calcula indicadores y la señal, y limpia consecutivas.
-    NO decide si la vela está cerrada.
-    """
-    print(f"🔄 Procesando {symbol}")
-    df = get_binance_4h_data(symbol)
-    df = calculate_indicators(df)
-    df = calcular_momentum_integral(df, window=6)
-    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')  # crea/actualiza 'Signal Final'
-    return df
-
 def main():
     print("🚀 Iniciando verificación de señales...")
     # Lista de símbolos configurable por env
@@ -91,45 +78,56 @@ def main():
 
     for symbol in symbols:
         try:
-            # 1) Calcula indicadores normalmente (histórico)
-            df = procesar_symbol(symbol)
-
-            # 2) Confirma la ventana de la ÚLTIMA vela 4H CERRADA (UTC)
+            # 1) Confirma la ventana de la ÚLTIMA vela 4H CERRADA (UTC) y base usada
             last_open_ms, last_close_ms, base = _last_closed_for(symbol)
-            last_open_utc = pd.to_datetime(last_open_ms, unit="ms", utc=True)
+            last_open_utc  = pd.to_datetime(last_open_ms,  unit="ms", utc=True)
+            # Binance reporta close time como endTime; para la vela cerrada anterior usamos last_close_ms-1
+            last_close_utc_minus1 = pd.to_datetime(last_close_ms - 1, unit="ms", utc=True)
 
-            # 3) Selecciona EXACTAMENTE esa vela por 'Open time UTC'
-            fila = df[df["Open time UTC"] == last_open_utc]
+            # 2) Descarga histórico alineado a la MISMA base para evitar cortes distintos
+            df = get_binance_4h_data(symbol, preferred_base=base)
+
+            # 3) Calcula indicadores y señal sobre el histórico alineado
+            df = calculate_indicators(df)
+            df = calcular_momentum_integral(df, window=6)
+            df = limpiar_señales_consecutivas(df, columna='Momentum Signal')  # crea/actualiza 'Signal Final'
+
+            # 4) Selecciona EXACTAMENTE la vela cerrada por open & close
+            fila = df[(df["Open time UTC"] == last_open_utc) & (df["Close time UTC"] == last_close_utc_minus1)]
             if fila.empty:
-                # Fallback por posibles desalineaciones de segundos: busca ±60s
+                # Fallback ±60s por cualquier drift, chequeando ambos bordes
                 try:
-                    ms_series = (df["Open time UTC"].astype("int64") // 1_000_000)
+                    open_ms_series  = (df["Open time UTC"].astype("int64")  // 1_000_000)
+                    close_ms_series = (df["Close time UTC"].astype("int64") // 1_000_000)
                 except Exception:
-                    ms_series = (df["Open time UTC"].view("int64") // 1_000_000)
+                    open_ms_series  = (df["Open time UTC"].view("int64")  // 1_000_000)
+                    close_ms_series = (df["Close time UTC"].view("int64") // 1_000_000)
 
-                df["_delta_ms"] = ms_series - last_open_ms
-                cand = df[df["_delta_ms"].abs() <= 60_000]
+                df["_open_delta_ms"]  = open_ms_series  - last_open_ms
+                df["_close_delta_ms"] = close_ms_series - (last_close_ms - 1)
+                cand = df[(df["_open_delta_ms"].abs() <= 60_000) & (df["_close_delta_ms"].abs() <= 60_000)]
                 if cand.empty:
-                    print(f"⚠️ {symbol}: no encontré la fila de la vela cerrada (open_utc={last_open_utc}).")
+                    print(f"⚠️ {symbol}: no encontré la vela cerrada EXACTA (open={last_open_utc}, close≈{last_close_utc_minus1}).")
                     continue
                 fila = cand.iloc[[-1]]
 
-            fila = fila.iloc[0]  # Series de la vela cerrada
+            fila = fila.iloc[0]  # Series de la vela cerrada exacta
 
-            # 4) Señal SOLO de la vela cerrada
+            # 5) Señal SOLO de la vela cerrada
             señal = fila.get('Signal Final', None)
             precio = float(fila.get('Close', float('nan')))
-            fecha_cr = fila.get('Open time')  # en CR (string/ts bonito para mostrar)
+            # Mostrar HORA DE CIERRE en CR (ya viene en df por fetch)
+            fecha_cr = fila.get('Close time')
 
-            # 5) Registrar estado como ya hacías (almacena la señal actual)
+            # 6) Registrar estado como ya hacías (almacena la señal actual)
             estado_actual[symbol] = señal
 
-            # 6) Envío a Telegram (si hay señal y cambió)
+            # 7) Envío a Telegram (si hay señal y cambió)
             if señal in ['BUY', 'SELL']:
                 if estado_anterior.get(symbol) != señal:
 
                     if señal == 'BUY':
-                        # ===== BUY: mensaje enriquecido con SL/TPs =====
+                        # ===== BUY: mensaje enriquecido con SL/TPs (R:R) =====
                         # Recortar DF hasta la vela cerrada para evitar look-ahead
                         df_recorte = df[df["Open time UTC"] <= last_open_utc].copy()
 
@@ -151,7 +149,7 @@ def main():
                             atr_k=ATR_K
                         )
 
-                        # Mensaje enriquecido
+                        # Mensaje enriquecido (fecha de CIERRE)
                         mensaje = format_signal_msg(
                             symbol=symbol,
                             side='BUY',
