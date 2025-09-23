@@ -79,13 +79,17 @@ def _fetch_klines(base: str, symbol: str, interval: str, limit: int, timeout: in
         raise ValueError(f"Formato inesperado desde {base}: {data}")
     return data
 
-def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
+def get_binance_4h_data(symbol: str, limit: int = 300, preferred_base: str = None) -> pd.DataFrame:
     """
-    Descarga velas 4h desde MIRROR/.US solamente (histórico).
-    Memoriza el host exitoso por símbolo y loguea los intentos.
+    Descarga velas 4h desde MIRROR/.US.
+    Si preferred_base está presente y soportada, la prueba primero para alinear cortes de vela.
     """
     limit = max(50, min(int(limit), 1000))
     bases = _bases_for(symbol)
+
+    # NUEVO: probar primero la base preferida (la misma con la que confirmaste la última cerrada)
+    if preferred_base and preferred_base in bases:
+        bases = [preferred_base] + [b for b in bases if b != preferred_base]
 
     last_exc = None
     print(f"[binance_fetch] {symbol} → probando bases en orden: {bases}")
@@ -99,18 +103,19 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
             ]
             df = pd.DataFrame(data, columns=cols)
 
-            # 1) Numéricos primero
+            # 1) Numéricos
             for c in ["Open","High","Low","Close","Volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # 2) Tiempos: crear UTC desde ms
+            # 2) Tiempos (UTC)
             df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
             df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
 
-            # 3) Derivar hora local (CR) para visualización
-            df["Open time"] = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
+            # 3) Tiempos en CR (visual)
+            df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
+            df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
 
-            # 4) Ordenar por tiempo (usa UTC para evitar confusiones)
+            # 4) Orden
             df = df.sort_values("Open time UTC").reset_index(drop=True)
 
             _PREFERRED_BASE[symbol] = base
@@ -122,8 +127,8 @@ def get_binance_4h_data(symbol: str, limit: int = 300) -> pd.DataFrame:
             last_exc = e
             continue
 
-    # falló todo
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
+
 
 
 # =========================
@@ -175,4 +180,5 @@ def fetch_last_closed_kline(symbol: str, base_url: str, session=None):
     # hint de base preferida al tener éxito
     _PREFERRED_BASE[symbol] = base_url
     return k, last_open, last_close, server_time_ms
+
 
