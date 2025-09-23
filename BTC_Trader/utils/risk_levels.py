@@ -41,22 +41,19 @@ def stop_loss_from_swing(
 
 def take_profits_rr(entry: float, sl: float, side: Literal["BUY","SELL"], rr_targets: List[float]) -> List[float]:
     """
-    Calcula TPs por múltiplos de riesgo (R:R).
-    Riesgo = |entry - SL|. Para BUY: TP = entry + R*riesgo. (Para SELL: entry - R*riesgo)
+    TPs por múltiplos de riesgo (R:R).
+    Riesgo = |entry - SL|.
+    BUY: TP = entry + R*risk
+    SELL: TP = entry - R*risk
     """
     risk = abs(entry - sl)
     if risk == 0 or np.isnan(risk):
-        # No se puede calcular TPs por R:R; devolvemos NaNs
         return [np.nan for _ in rr_targets]
 
-    tps = []
     if side == "BUY":
-        for r in rr_targets:
-            tps.append(entry + r * risk)
+        return [entry + r * risk for r in rr_targets]
     else:
-        for r in rr_targets:
-            tps.append(entry - r * risk)
-    return tps
+        return [entry - r * risk for r in rr_targets]
 
 def build_levels(
     df: pd.DataFrame,
@@ -66,24 +63,17 @@ def build_levels(
     sl_method: Literal["window","fractal"] = "window",
     window: int = 5, left: int = 2, right: int = 2, atr_k: float = 0.0
 ) -> Dict:
-    """
-    Construye niveles usando R:R (múltiplos de riesgo) en lugar de % sobre la entrada.
-    Devuelve dict con entry, sl, tps y rr (iguales a rr_targets).
-    """
     sl = stop_loss_from_swing(
         df, side=side, method=sl_method, window=window, left=left, right=right, atr_k=atr_k
     )
     tps = take_profits_rr(entry, sl, side, rr_targets)
 
-    # R:R de cada TP respecto al riesgo unitario (por construcción es el propio target)
-    rr_list = rr_targets[:]
-
     return {
         "entry": float(entry),
         "sl": float(sl),
         "tps": [float(x) if not np.isnan(x) else np.nan for x in tps],
-        "rr": rr_list,
-        "rr_targets": rr_targets
+        "rr": rr_targets[:],          # por claridad
+        "rr_targets": rr_targets[:]   # alias
     }
 
 def format_signal_msg(
@@ -94,11 +84,15 @@ def format_signal_msg(
     source_url: str
 ) -> str:
     """
-    Formatea el mensaje para BUY/SELL. Para BUY, muestra TPs basados en R:R.
-    Para SELL puedes usarlo igual (aunque en tu bot se deja simple).
+    Mensaje limpio centrado en R:R (sin % vs entrada).
+    Pensado para BUY; para SELL tu bot usa formato simple.
     """
-    arrow = "🟢" if side=="BUY" else "🔴"
-    entry = levels["entry"]; sl = levels["sl"]; tps = levels["tps"]; rr_targets = levels.get("rr_targets", levels.get("rr", []))
+    arrow = "🟢" if side == "BUY" else "🔴"
+    entry = levels["entry"]
+    sl    = levels["sl"]
+    tps   = levels["tps"]
+    rr_targets = levels.get("rr_targets", levels.get("rr", []))
+
     lines = [
         f"{arrow} NUEVA SEÑAL para {symbol}:",
         f"📍 {side}",
@@ -106,16 +100,11 @@ def format_signal_msg(
         f"🛑 Stop Loss: {sl:,.6f}",
     ]
 
-    # Distancia porcentual opcional (útil para info extra); si no la querés, comentá move_pct_line
-    risk = abs(entry - sl)
     for i, (tp, rmult) in enumerate(zip(tps, rr_targets), start=1):
         if np.isnan(tp):
-            line = f"🎯 TP{i}: N/A (R:R {rmult:.2f}x)"
+            lines.append(f"🎯 TP{i}: N/A (R:R {rmult:.2f}x)")
         else:
-            # % de movimiento respecto a entrada, solo informativo
-            move_pct = (tp/entry - 1.0) * (100 if side=="BUY" else -100)
-            line = f"🎯 TP{i}: {tp:,.6f} (R:R {rmult:.2f}x) ({move_pct:+.2f}% vs entrada)"
-        lines.append(line)
+            lines.append(f"🎯 TP{i}: {tp:,.6f} (R:R {rmult:.2f}x)")
 
     lines += [
         f"🕒 {ts_local_str} (CR)",
