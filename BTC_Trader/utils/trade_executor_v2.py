@@ -151,9 +151,12 @@ def _get_free_balance(asset: str) -> float:
 
 
 def _append_log(row: dict):
+    """Agrega una línea al trade_log.csv con campos ordenados y visible en consola."""
     df = pd.DataFrame([row])
     header = not os.path.exists(LOG_FILE)
     df.to_csv(LOG_FILE, mode="a", header=header, index=False)
+    print(f"🧾 Log registrado: {row.get('action')} {row.get('symbol')} ({'DRY_RUN' if row.get('dry_run') else 'LIVE'})")
+
 
 # =============================
 # 2) Cálculo TP/SL
@@ -231,42 +234,169 @@ def sell_all_market(symbol):
 # =============================
 
 def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pct=None):
-    if not BINANCE_ENABLED:
-        print(f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas.")
-        return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+    try:
+        if not BINANCE_ENABLED:
+            msg = f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas."
+            print(msg)
+            _append_log({
+                "timestamp": datetime.utcnow(),
+                "symbol": symbol,
+                "action": "SKIPPED_NO_KEYS",
+                "message": msg,
+                "dry_run": DRY_RUN
+            })
+            return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
 
-    equity = _get_spot_equity_usdt()
-    weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
-    usdt_to_spend = min(equity * weight, _get_free_balance("USDT"))
-    price = _get_price(symbol)
-    if usdt_to_spend < 10:
-        return {"status": "INSUFFICIENT_USDT", "symbol": symbol}
+        # --- 1️⃣ Revisar balances y equity ---
+        equity = _get_spot_equity_usdt()
+        free_usdt = _get_free_balance("USDT")
+        weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
+        usdt_to_spend = min(equity * weight, free_usdt)
 
-    buy_order = place_market_buy_by_quote(symbol, usdt_to_spend)
-    entry_price = price
-    qty = float(buy_order.get("executedQty", usdt_to_spend / price))
+        price = _get_price(symbol)
+        if not price:
+            raise ValueError("No se pudo obtener el precio del símbolo")
 
-    if tp_price is None:
-        tp_price, sl_limit, sl_trigger = compute_tp_sl(entry_price, rr, risk_pct)
-    else:
-        sl_limit = entry_price * (1 - (sl_limit_pct or DEFAULT_RISK_PCT))
-        sl_trigger = sl_limit * (1 + SL_TRIGGER_GAP)
+        filters = _get_symbol_filters(symbol)
+        min_notional = filters["min_notional"]
 
-    oco = place_oco_sell(symbol, qty, tp_price, sl_limit, sl_trigger)
-    _append_log({"ts": datetime.utcnow().isoformat(), "symbol": symbol, "action": "BUY+OCO",
-                 "dry_run": DRY_RUN, "usdt_spent": usdt_to_spend, "tp": tp_price})
-    return {"buy": buy_order, "oco": oco}
+        if usdt_to_spend < max(min_notional, 10.0):
+            msg = f"❌ USDT insuficiente ({usdt_to_spend:.2f} < {min_notional:.2f})"
+            print(msg)
+            _append_log({
+                "timestamp": datetime.utcnow(),
+                "symbol": symbol,
+                "action": "INSUFFICIENT_USDT",
+                "equity_total": equity,
+                "free_usdt": free_usdt,
+                "usdt_spent": usdt_to_spend,
+                "message": msg,
+                "dry_run": DRY_RUN
+            })
+            return {"status": "INSUFFICIENT_USDT", "symbol": symbol}
+
+        # --- 2️⃣ Ejecutar Market BUY ---
+        print(f"🟢 Ejecutando BUY {symbol} por {usdt_to_spend:.2f} USDT (equity={equity:.2f}, balance={free_usdt:.2f})")
+        buy_order = place_market_buy_by_quote(symbol, usdt_to_spend)
+
+        entry_price = float(buy_order.get("price", price))
+        qty = float(buy_order.get("executedQty", usdt_to_spend / price))
+
+        # --- 3️⃣ Calcular TP/SL ---
+        if tp_price is None:
+            tp_price, sl_limit, sl_trigger = compute_tp_sl(entry_price, rr, risk_pct)
+        else:
+            sl_limit = entry_price * (1 - (sl_limit_pct or DEFAULT_RISK_PCT))
+            sl_trigger = sl_limit * (1 + SL_TRIGGER_GAP)
+
+        # --- 4️⃣ Colocar OCO ---
+        print(f"🎯 Colocando OCO {symbol} (TP={tp_price:.4f}, SL={sl_limit:.4f}, Trigger={sl_trigger:.4f})")
+        oco = place_oco_sell(symbol, qty, tp_price, sl_limit, sl_trigger)
+
+        # --- 5️⃣ Log completo ---
+        _append_log({
+            "timestamp": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "action": "BUY+OCO",
+            "equity_total": equity,
+            "free_usdt": free_usdt,
+            "usdt_spent": usdt_to_spend,
+            "entry_price": entry_price,
+            "qty": qty,
+            "tp_price": tp_price,
+            "sl_price": sl_limit,
+            "sl_trigger": sl_trigger,
+            "dry_run": DRY_RUN,
+            "message": "Buy ejecutado y OCO colocado correctamente"
+        })
+
+        return {"buy": buy_order, "oco": oco}
+
+    except Exception as e:
+        err = f"⚠️ Error en BUY {symbol}: {e}"
+        print(err)
+        _append_log({
+            "timestamp": datetime.utcnow(),
+            "symbol": symbol,
+            "action": "ERROR_BUY",
+            "message": str(e),
+            "dry_run": DRY_RUN
+        })
+        return {"status": "ERROR", "error": str(e)}
+
 
 
 def handle_sell_signal(symbol):
-    if not BINANCE_ENABLED:
-        print(f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas.")
-        return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
-    cancel = cancel_open_oco(symbol)
-    sell = sell_all_market(symbol)
-    _append_log({"ts": datetime.utcnow().isoformat(), "symbol": symbol,
-                 "action": "CANCEL_OCO+SELL", "dry_run": DRY_RUN})
-    return {"cancel": cancel, "sell": sell}
+    try:
+        if not BINANCE_ENABLED:
+            msg = f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas."
+            print(msg)
+            _append_log({
+                "timestamp": datetime.utcnow(),
+                "symbol": symbol,
+                "action": "SKIPPED_NO_KEYS",
+                "message": msg,
+                "dry_run": DRY_RUN
+            })
+            return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+
+        # --- 1️⃣ Cancelar OCO activo ---
+        print(f"🔍 Buscando OCO activo para {symbol}...")
+        cancel_res = cancel_open_oco(symbol)
+        if cancel_res:
+            print(f"🟡 OCO encontrado y cancelado ({len(cancel_res)} órdenes).")
+        else:
+            print("⚠️ No se encontraron OCOs activos.")
+
+        # --- 2️⃣ Revisar balance disponible ---
+        asset = symbol.replace("USDT", "")
+        free_qty = _get_free_balance(asset)
+        equity = _get_spot_equity_usdt()
+
+        if free_qty <= 0:
+            msg = f"❌ No hay balance disponible para vender {asset}."
+            print(msg)
+            _append_log({
+                "timestamp": datetime.utcnow(),
+                "symbol": symbol,
+                "action": "NO_POSITION",
+                "equity_total": equity,
+                "free_qty": free_qty,
+                "message": msg,
+                "dry_run": DRY_RUN
+            })
+            return {"status": "NO_POSITION", "symbol": symbol}
+
+        # --- 3️⃣ Ejecutar venta a mercado ---
+        print(f"🔴 Ejecutando Market SELL {symbol} — cantidad={free_qty:.6f}")
+        sell_res = sell_all_market(symbol)
+
+        # --- 4️⃣ Log completo ---
+        _append_log({
+            "timestamp": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "action": "CANCEL_OCO+SELL",
+            "equity_total": equity,
+            "free_qty": free_qty,
+            "dry_run": DRY_RUN,
+            "message": "Cancelación y venta ejecutadas correctamente"
+        })
+        print(f"✅ SELL completado para {symbol}. (DRY_RUN={DRY_RUN})")
+
+        return {"cancel": cancel_res, "sell": sell_res}
+
+    except Exception as e:
+        err = f"⚠️ Error en SELL {symbol}: {e}"
+        print(err)
+        _append_log({
+            "timestamp": datetime.utcnow(),
+            "symbol": symbol,
+            "action": "ERROR_SELL",
+            "message": str(e),
+            "dry_run": DRY_RUN
+        })
+        return {"status": "ERROR", "error": str(e)}
+
 
 # =============================
 # 5) Enrutador
