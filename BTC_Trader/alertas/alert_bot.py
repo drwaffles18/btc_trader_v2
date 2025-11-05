@@ -19,12 +19,15 @@ from utils.binance_fetch import (
     bases_para,
 )
 from utils.risk_levels import build_levels, format_signal_msg
+from utils.trade_executor_v2 import route_signal  # 🧩 NUEVO: Autotrader
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Ventana de gracia (min) ABSOLUTA: bloquea cualquier envío tardío (aunque no haya estado previo)
+
+
+# Ventana de gracia (min) ABSOLUTA: bloquea cualquier envío tardío
 GRACE_MINUTES = int(os.getenv("GRACE_MINUTES", "15"))
 
 def enviar_mensaje_telegram(mensaje: str):
@@ -43,10 +46,6 @@ def enviar_mensaje_telegram(mensaje: str):
         print(f"⚠️ Excepción enviando mensaje a Telegram: {e}")
 
 def _last_closed_for(symbol: str):
-    """
-    Devuelve (last_open_ms, last_close_ms, base_usada, server_ms)
-    consultando /time y /klines con endTime=last_close-1 para evitar velas en curso.
-    """
     for base in bases_para(symbol):
         try:
             _k, last_open, last_close, server_ms = fetch_last_closed_kline(symbol, base)
@@ -63,103 +62,57 @@ def main():
     symbols = [s.strip().upper() for s in env_symbols.split(",")] if env_symbols else \
               ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
-    # Parámetros para niveles (solo aplican para BUY)
-    SL_METHOD = os.getenv("SL_METHOD", "window").lower()  # "window" | "fractal"
+    SL_METHOD = os.getenv("SL_METHOD", "window").lower()
     SL_WINDOW = int(os.getenv("SL_WINDOW", "5"))
     SL_LEFT   = int(os.getenv("SL_LEFT", "2"))
     SL_RIGHT  = int(os.getenv("SL_RIGHT", "2"))
     ATR_K     = float(os.getenv("ATR_K", "0.0"))
     RR_TARGETS = [float(x) for x in os.getenv("RR_TARGETS", "1.0,1.5,1.75").split(",")]
 
-    estado_anterior = cargar_estado_anterior()  # {SYM: {"signal": str|None, "last_close_ms": int}}
+    estado_anterior = cargar_estado_anterior()
     print(f"📥 Estado anterior cargado: {estado_anterior}")
     estado_actual = {}
 
     for symbol in symbols:
         try:
             print(f"\n===================== {symbol} =====================")
-            # 1) Confirmar última vela 4H CERRADA (UTC) + base + hora server
             last_open_ms, last_close_ms, base, server_ms = _last_closed_for(symbol)
             last_open_utc  = pd.to_datetime(last_open_ms,  unit="ms", utc=True)
             last_close_utc_minus1 = pd.to_datetime(last_close_ms - 1, unit="ms", utc=True)
-            print(f"[{symbol}] Ventana cerrada: open_utc={last_open_utc} | close_utc≈{last_close_utc_minus1} | base={base}")
 
-            # 2) Cargar estado previo
             prev = estado_anterior.get(symbol, {"signal": None, "last_close_ms": 0})
             prev_signal = prev.get("signal")
             prev_close  = prev.get("last_close_ms", 0)
 
-            # 3) Gracia ABSOLUTA: si la vela cerró hace demasiado tiempo, NO enviar nada.
+            # Grace period
             if GRACE_MINUTES > 0:
                 delta_ms = server_ms - last_close_ms
-                print(f"[{symbol}] Δ(server_ms - last_close_ms) = {delta_ms} ms (grace={GRACE_MINUTES}m)")
                 if delta_ms > (GRACE_MINUTES * 60 * 1000):
                     print(f"⏭️ [{symbol}] vela cerrada hace más de {GRACE_MINUTES}m → no envío señal atrasada.")
-                    # Registramos igual la vela para no reevaluarla en el próximo cron
                     estado_actual[symbol] = {"signal": None, "last_close_ms": last_close_ms}
                     continue
 
-            # 4) Descarga histórico ALINEADO a la MISMA base
             print(f"[{symbol}] Descargando histórico con preferred_base={base} ...")
             df = get_binance_4h_data(symbol, preferred_base=base)
-            print(f"[{symbol}] Histórico recibido: filas={len(df)} "
-                  f"rango={df['Open time UTC'].iloc[0]} → {df['Open time UTC'].iloc[-1]}")
-
-            # 5) Indicadores + señal cruda
             df = calculate_indicators(df)
             df = calcular_momentum_integral(df, window=6)
-
-            # 6) Señal “limpia” como en el chart (propagada) para detectar TRANSICIÓN
             df_clean = limpiar_señales_consecutivas(df, columna='Momentum Signal')
             df['Signal Final'] = df_clean['Signal Final']
 
-            # 7) Selección exacta de la vela cerrada (open & close)
-            exact = df[(df["Open time UTC"] == last_open_utc) & (df["Close time UTC"] == last_close_utc_minus1)]
-            print(f"[{symbol}] Match exacto open&close: {len(exact)} filas")
+            exact = df[(df["Open time UTC"] == last_open_utc) &
+                       (df["Close time UTC"] == last_close_utc_minus1)]
             if exact.empty:
-                # Fallback ±60s en ambos bordes
-                try:
-                    open_ms_series  = (df["Open time UTC"].astype("int64")  // 1_000_000)
-                    close_ms_series = (df["Close time UTC"].astype("int64") // 1_000_000)
-                except Exception:
-                    open_ms_series  = (df["Open time UTC"].view("int64")  // 1_000_000)
-                    close_ms_series = (df["Close time UTC"].view("int64") // 1_000_000)
+                print(f"⚠️ [{symbol}] No encontré la vela cerrada EXACTA.")
+                estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
+                continue
+            fila = exact.iloc[0]
 
-                df["_open_delta_ms"]  = open_ms_series  - last_open_ms
-                df["_close_delta_ms"] = close_ms_series - (last_close_ms - 1)
-                cand = df[(df["_open_delta_ms"].abs() <= 60_000) & (df["_close_delta_ms"].abs() <= 60_000)]
-                print(f"[{symbol}] Fallback ±60s: candidatos={len(cand)}")
-                if cand.empty:
-                    print(f"⚠️ [{symbol}] no encontré la vela cerrada EXACTA (open={last_open_utc}, close≈{last_close_utc_minus1}).")
-                    estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
-                    continue
-                fila = cand.iloc[[-1]]
-            else:
-                fila = exact
-
-            fila = fila.iloc[0]
-
-            # 8) Señales de ESTA vela
-            raw_signal  = fila.get('Momentum Signal', None)   # cruda (info)
-            prop_signal = fila.get('Signal Final', None)      # “limpia” (chart)
+            raw_signal  = fila.get('Momentum Signal', None)
+            prop_signal = fila.get('Signal Final', None)
             price  = float(fila.get('Close', float('nan')))
-            fecha_cr = fila.get('Close time')                 # hora de cierre en CR
-            print(f"[{symbol}] Señal cruda en vela cerrada: Momentum={raw_signal} | Propagada={prop_signal} | price={price:,.4f} fecha_CR={fecha_cr}")
+            fecha_cr = fila.get('Close time')
 
-            # 9) Emular el gráfico: disparar SOLO si hay TRANSICIÓN de Signal Final
-            #    (primera vela del nuevo tramo BUY/SELL)
-            #    Localizamos la fila previa en df_clean de forma robusta
-            try:
-                idx = df_clean.index.get_loc(fila.name)
-            except Exception:
-                mask_ts = (df_clean["Open time UTC"] == fila["Open time UTC"])
-                if not mask_ts.any():
-                    print(f"[{symbol}] ⚠️ No pude localizar la fila en df_clean por timestamp; no se dispara señal.")
-                    estado_actual[symbol] = {"signal": None, "last_close_ms": last_close_ms}
-                    continue
-                # obtener el índice posicional de la primera coincidencia
-                idx = df_clean.index.get_indexer_for(df_clean.index[mask_ts])[0]
-
+            idx = df_clean.index.get_loc(fila.name)
             prev_clean = df_clean.iloc[idx-1]['Signal Final'] if idx > 0 else None
             curr_clean = prop_signal
 
@@ -169,17 +122,12 @@ def main():
             elif curr_clean == 'SELL' and prev_clean != 'SELL':
                 signal = 'SELL'
 
-            print(f"[{symbol}] Chart-like transition: prev_clean={prev_clean} -> curr_clean={curr_clean} => signal={signal}")
-
-            # 10) DEDUP estricto: máximo 1 envío por vela
             debe_enviar = (last_close_ms != prev_close) and (signal in ['BUY', 'SELL'])
-            print(f"[{symbol}] Estado previo: signal={prev_signal} last_close_ms={prev_close}")
-            print(f"[{symbol}] Estado actual : signal={signal} last_close_ms={last_close_ms}")
-            print(f"[{symbol}] ¿Debe enviar? {debe_enviar}")
+            print(f"[{symbol}] ¿Debe enviar? {debe_enviar} | signal={signal}")
 
             if debe_enviar:
                 if signal == 'BUY':
-                    # Recorte para niveles (evita look-ahead)
+                    # --- Cálculo de niveles ---
                     df_recorte = df[df["Open time UTC"] <= last_open_utc].copy()
                     for col in ["High", "Low", "Close"]:
                         if col not in df_recorte.columns:
@@ -196,8 +144,6 @@ def main():
                         right=SL_RIGHT,
                         atr_k=ATR_K
                     )
-                    print(f"[{symbol}] Niveles calculados: SL={levels['sl']:.6f} "
-                          f"TPs={', '.join(f'{t:.6f}' for t in levels['tps'])} RR={levels['rr']}")
                     mensaje = format_signal_msg(
                         symbol=symbol,
                         side='BUY',
@@ -205,8 +151,27 @@ def main():
                         ts_local_str=str(fecha_cr),
                         source_url=base
                     )
-                else:
-                    # SELL simple como en la app/mensajes anteriores
+
+                    print(f"[{symbol}] 📢 Enviando:\n{mensaje}")
+                    enviar_mensaje_telegram(mensaje)
+
+                    # 🚀 Ejecutar trade (Market + OCO)
+                    try:
+                        rr_target = 1.5  # usa TP2
+                        tp_price = levels['tps'][1] if len(levels['tps']) > 1 else levels['tps'][0]
+                        sl_limit_pct = abs(price - levels['sl']) / price
+                        trade_result = route_signal({
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "tp_price": tp_price,
+                            "sl_limit_pct": sl_limit_pct,
+                            "rr": rr_target
+                        })
+                        print(f"[{symbol}] 🛒 Resultado trade BUY: {trade_result}")
+                    except Exception as e:
+                        print(f"⚠️ [{symbol}] Error ejecutando trade BUY: {e}")
+
+                elif signal == 'SELL':
                     mensaje = (
                         f"🔴 NUEVA SEÑAL para {symbol}:\n"
                         f"📍 SELL\n"
@@ -215,8 +180,16 @@ def main():
                         f"🔗 base: {base}"
                     )
 
-                print(f"[{symbol}] 📢 Enviando:\n{mensaje}")
-                enviar_mensaje_telegram(mensaje)
+                    print(f"[{symbol}] 📢 Enviando:\n{mensaje}")
+                    enviar_mensaje_telegram(mensaje)
+
+                    # 🚀 Cancelar OCO y vender posición
+                    try:
+                        trade_result = route_signal({"symbol": symbol, "side": "SELL"})
+                        print(f"[{symbol}] 💰 Resultado trade SELL: {trade_result}")
+                    except Exception as e:
+                        print(f"⚠️ [{symbol}] Error ejecutando trade SELL: {e}")
+
                 estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
             else:
                 print(f"[{symbol}] ⏭️ No se envía (transición={signal is not None}, curr_clean={curr_clean}).")
@@ -231,3 +204,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
