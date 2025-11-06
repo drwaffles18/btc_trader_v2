@@ -22,8 +22,21 @@ from utils.risk_levels import build_levels, format_signal_msg
 from utils.trade_executor_v2 import route_signal  # 🧩 NUEVO: Autotrader
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ==========================================================
+# 🔑 VARIABLES DE ENTORNO (Railway las inyecta automáticamente)
+# ==========================================================
+
+BINANCE_API_KEY_TRADING    = os.getenv("BINANCE_API_KEY_TRADING")
+BINANCE_API_SECRET_TRADING = os.getenv("BINANCE_API_SECRET_TRADING")
+DRY_RUN                    = os.getenv("DRY_RUN", "false").lower() == "true"
+STATE_PATH                 = os.getenv("STATE_PATH", "./estado.json")
+TRADE_LOG_PATH             = os.getenv("TRADE_LOG_PATH", "./trade_logs.csv")
+
+TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+GRACE_MINUTES = int(os.getenv("GRACE_MINUTES", "15"))
+
 
 
 
