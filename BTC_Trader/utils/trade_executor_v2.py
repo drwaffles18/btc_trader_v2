@@ -1,36 +1,15 @@
 # =============================================================
-# 🟢 Binance Spot Autotrader con OCO — Victor + GPT
+# 🟢 Binance Spot Autotrader con OCO — Victor + GPT (versión limpia)
 # -------------------------------------------------------------
 # Objetivo:
 # - Ejecutar compras Market por porcentaje del equity total (wallet Spot)
-# - Colocar automáticamente una orden OCO (Take Profit + Stop Loss) tras cada compra
-# - Cancelar OCO activa y vender Market al recibir señal SELL
-# - Respeta pesos por símbolo (BTC, ETH, ADA, XRP, BNB)
-#
-# Notas clave:
-# - TP: puede venir dado por la señal (tp_price). Si no viene, se calcula con RR
-#   usando una pérdida por defecto (risk_pct) y RR provista (rr). Ej: RR=1.5
-# - SL: stop-limit por debajo del precio de entrada; el TRIGGER se coloca 5% por
-#   encima del stop-limit (requerimiento del usuario)
-# - Manejo de filtros de Binance: LOT_SIZE, MIN_NOTIONAL, PRICE_FILTER
-# - Registro en CSV de operaciones
-# - DRY_RUN para pruebas (simula sin enviar órdenes)
-#
-# Requisitos:
-#   pip install python-binance pandas python-dotenv
-# =============================================================
-# =============================================================
-# 🟢 Binance Spot Autotrader con OCO — Victor + GPT (versión segura)
-# -------------------------------------------------------------
-# Objetivo:
-# - Ejecutar compras Market por porcentaje del equity total (wallet Spot)
-# - Colocar automáticamente una orden OCO (Take Profit + Stop Loss) tras cada compra
+# - Colocar automáticamente una orden OCO (Take Profit + Stop Loss)
 # - Cancelar OCO activa y vender Market al recibir señal SELL
 # - Respeta pesos por símbolo (BTC, ETH, ADA, XRP, BNB)
 #
 # Seguridad:
-# - Si no hay claves de Binance configuradas, entra en modo “solo alertas”
-# - DRY_RUN permite simular trades sin enviar órdenes reales
+# - Si no hay claves configuradas, entra en modo “solo alertas”
+# - DRY_RUN permite simular sin enviar órdenes reales
 # =============================================================
 
 import os
@@ -38,9 +17,7 @@ import math
 import time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-
 import pandas as pd
-from dotenv import load_dotenv
 
 # Intentamos importar el cliente solo si hay claves
 try:
@@ -52,7 +29,6 @@ except ImportError:
 # =============================
 # 0) Configuración general
 # =============================
-load_dotenv()
 
 API_KEY    = os.getenv("BINANCE_API_KEY_TRADING") or os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET_TRADING") or os.getenv("BINANCE_API_SECRET")
@@ -78,7 +54,7 @@ PORTFOLIO_WEIGHTS = {
 }
 
 # Archivo de logs
-LOG_FILE = "/data/trade_log.csv"
+LOG_FILE = os.getenv("TRADE_LOG_PATH", "./trade_log.csv")
 
 # Parámetros por defecto
 DEFAULT_RISK_PCT = 0.01
@@ -90,6 +66,7 @@ SL_TRIGGER_GAP   = 0.05
 # =============================
 
 def _round_step_size(value: float, step_size: float) -> float:
+    """Redondea el valor al múltiplo más cercano permitido por el filtro LOT_SIZE."""
     if step_size == 0:
         return value
     precision = int(round(-math.log(step_size, 10), 0)) if step_size < 1 else 0
@@ -122,23 +99,25 @@ def _get_price(symbol: str) -> float:
 
 
 def _get_spot_equity_usdt() -> float:
+    """Devuelve el equity total estimado en USDT."""
     if not BINANCE_ENABLED:
         return 1000.0  # simulación base
     account = client.get_account()
     balances = {b["asset"]: {"free": float(b["free"]), "locked": float(b["locked"])} for b in account.get("balances", [])}
-    equity = balances.get("USDT", {"free": 0, "locked": 0})
-    total = equity["free"] + equity["locked"]
+    total = balances.get("USDT", {"free": 0, "locked": 0})
+    total_usdt = total["free"] + total["locked"]
     for asset, bal in balances.items():
-        if asset in ("USDT", "BUSD", "FDUSD"): continue
+        if asset in ("USDT", "BUSD", "FDUSD"):
+            continue
         qty = bal["free"] + bal["locked"]
         if qty > 0:
             symbol = f"{asset}USDT"
             try:
-                p = _get_price(symbol)
-                total += qty * p
+                price = _get_price(symbol)
+                total_usdt += qty * price
             except Exception:
                 pass
-    return total
+    return total_usdt
 
 
 def _get_free_balance(asset: str) -> float:
@@ -151,12 +130,11 @@ def _get_free_balance(asset: str) -> float:
 
 
 def _append_log(row: dict):
-    """Agrega una línea al trade_log.csv con campos ordenados y visible en consola."""
+    """Agrega una línea al trade_log.csv."""
     df = pd.DataFrame([row])
     header = not os.path.exists(LOG_FILE)
     df.to_csv(LOG_FILE, mode="a", header=header, index=False)
     print(f"🧾 Log registrado: {row.get('action')} {row.get('symbol')} ({'DRY_RUN' if row.get('dry_run') else 'LIVE'})")
-
 
 # =============================
 # 2) Cálculo TP/SL
@@ -247,7 +225,6 @@ def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pc
             })
             return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
 
-        # --- 1️⃣ Revisar balances y equity ---
         equity = _get_spot_equity_usdt()
         free_usdt = _get_free_balance("USDT")
         weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
@@ -275,25 +252,21 @@ def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pc
             })
             return {"status": "INSUFFICIENT_USDT", "symbol": symbol}
 
-        # --- 2️⃣ Ejecutar Market BUY ---
         print(f"🟢 Ejecutando BUY {symbol} por {usdt_to_spend:.2f} USDT (equity={equity:.2f}, balance={free_usdt:.2f})")
         buy_order = place_market_buy_by_quote(symbol, usdt_to_spend)
 
         entry_price = float(buy_order.get("price", price))
         qty = float(buy_order.get("executedQty", usdt_to_spend / price))
 
-        # --- 3️⃣ Calcular TP/SL ---
         if tp_price is None:
             tp_price, sl_limit, sl_trigger = compute_tp_sl(entry_price, rr, risk_pct)
         else:
             sl_limit = entry_price * (1 - (sl_limit_pct or DEFAULT_RISK_PCT))
             sl_trigger = sl_limit * (1 + SL_TRIGGER_GAP)
 
-        # --- 4️⃣ Colocar OCO ---
         print(f"🎯 Colocando OCO {symbol} (TP={tp_price:.4f}, SL={sl_limit:.4f}, Trigger={sl_trigger:.4f})")
         oco = place_oco_sell(symbol, qty, tp_price, sl_limit, sl_trigger)
 
-        # --- 5️⃣ Log completo ---
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
@@ -325,7 +298,6 @@ def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pc
         return {"status": "ERROR", "error": str(e)}
 
 
-
 def handle_sell_signal(symbol):
     try:
         if not BINANCE_ENABLED:
@@ -340,7 +312,6 @@ def handle_sell_signal(symbol):
             })
             return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
 
-        # --- 1️⃣ Cancelar OCO activo ---
         print(f"🔍 Buscando OCO activo para {symbol}...")
         cancel_res = cancel_open_oco(symbol)
         if cancel_res:
@@ -348,7 +319,6 @@ def handle_sell_signal(symbol):
         else:
             print("⚠️ No se encontraron OCOs activos.")
 
-        # --- 2️⃣ Revisar balance disponible ---
         asset = symbol.replace("USDT", "")
         free_qty = _get_free_balance(asset)
         equity = _get_spot_equity_usdt()
@@ -367,11 +337,9 @@ def handle_sell_signal(symbol):
             })
             return {"status": "NO_POSITION", "symbol": symbol}
 
-        # --- 3️⃣ Ejecutar venta a mercado ---
         print(f"🔴 Ejecutando Market SELL {symbol} — cantidad={free_qty:.6f}")
         sell_res = sell_all_market(symbol)
 
-        # --- 4️⃣ Log completo ---
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
@@ -397,17 +365,20 @@ def handle_sell_signal(symbol):
         })
         return {"status": "ERROR", "error": str(e)}
 
-
 # =============================
 # 5) Enrutador
 # =============================
 
 def route_signal(signal: dict):
+    """Enruta la señal BUY/SELL a la función correspondiente."""
     symbol = signal.get("symbol")
     side = signal.get("side", "").upper()
     if side == "BUY":
-        return handle_buy_signal(symbol, rr=signal.get("rr"), risk_pct=signal.get("risk_pct"),
-                                 tp_price=signal.get("tp_price"), sl_limit_pct=signal.get("sl_limit_pct"))
+        return handle_buy_signal(symbol,
+                                 rr=signal.get("rr"),
+                                 risk_pct=signal.get("risk_pct"),
+                                 tp_price=signal.get("tp_price"),
+                                 sl_limit_pct=signal.get("sl_limit_pct"))
     elif side == "SELL":
         return handle_sell_signal(symbol)
     else:
