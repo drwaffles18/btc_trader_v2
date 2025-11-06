@@ -33,13 +33,36 @@ except ImportError:
 API_KEY    = os.getenv("BINANCE_API_KEY_TRADING") or os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET_TRADING") or os.getenv("BINANCE_API_SECRET")
 
+# ==========================================================
+# 🔒 Inicialización segura del cliente Binance
+# ==========================================================
+BINANCE_ENABLED = False
+client = None
+
 if not API_KEY or not API_SECRET or Client is None:
     print("⚠️ Claves Binance no configuradas o módulo no disponible. Modo solo alertas activo.")
-    BINANCE_ENABLED = False
-    client = None
 else:
-    BINANCE_ENABLED = True
-    client = Client(API_KEY, API_SECRET)
+    try:
+        client = Client(API_KEY, API_SECRET)
+        client.ping()  # 🔍 prueba de conexión rápida
+        BINANCE_ENABLED = True
+        print("✅ Cliente Binance inicializado correctamente.")
+    except Exception as e:
+        err = f"⚠️ Error al conectar con Binance: {e}"
+        print(err)
+        # --- registrar el error en el log, pero continuar la ejecución ---
+        try:
+            pd.DataFrame([{
+                "timestamp": datetime.utcnow().isoformat(),
+                "symbol": "SYSTEM",
+                "action": "BINANCE_INIT_ERROR",
+                "message": str(e),
+                "dry_run": os.getenv("DRY_RUN", "false").lower() == "true"
+            }]).to_csv("/data/trade_log.csv", mode="a", header=not os.path.exists("/data/trade_log.csv"), index=False)
+        except Exception as log_err:
+            print(f"⚠️ No se pudo registrar el error de Binance: {log_err}")
+        print("→ Continuando en modo solo alertas (sin ejecución real).")
+
 
 # Si quieres probar en modo simulado sin enviar órdenes reales
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
