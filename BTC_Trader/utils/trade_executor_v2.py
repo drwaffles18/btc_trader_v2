@@ -89,13 +89,26 @@ SL_TRIGGER_GAP   = 0.05
 # =============================
 
 def _round_step_size(value: float, step_size: float) -> float:
-    """Redondea el valor al múltiplo más cercano permitido por el filtro LOT_SIZE."""
+    """Redondea el valor al múltiplo más cercano permitido por LOT_SIZE o PRICE_FILTER."""
     if step_size == 0:
         return value
+
     precision = int(round(-math.log(step_size, 10), 0)) if step_size < 1 else 0
-    return float((Decimal(str(value)) // Decimal(str(step_size))) * Decimal(str(step_size))).quantize(
-        Decimal(f"1e-{precision}") if precision > 0 else Decimal("1"), rounding=ROUND_DOWN
-    )
+
+    dec_value = Decimal(str(value))
+    dec_step  = Decimal(str(step_size))
+
+    # Redondeo al múltiplo permitido
+    rounded = (dec_value // dec_step) * dec_step
+
+    # Aplicar quantize con precisión correcta
+    if precision > 0:
+        rounded = rounded.quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN)
+    else:
+        rounded = rounded.quantize(Decimal("1"), rounding=ROUND_DOWN)
+
+    return float(rounded)
+
 
 
 def _get_symbol_filters(symbol: str):
