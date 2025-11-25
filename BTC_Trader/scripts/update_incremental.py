@@ -10,7 +10,7 @@ from utils.binance_fetch import get_binance_5m_data
 
 # === CONFIGURACIÓN ===
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+DATA_DIR = "/data"
 MAX_ROWS = 900   # Mantener 3 días
 
 
