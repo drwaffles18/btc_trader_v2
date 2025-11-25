@@ -27,9 +27,9 @@ def main():
             print(f"➡️ Descargando {symbol}...")
             df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M)
 
-            # Guardar a Excel
-            output_path = os.path.join(DATA_DIR, f"{symbol}_5m.xlsx")
-            df.to_excel(output_path, index=False)
+            # Guardar a CSV (sin dependencias externas)
+            output_path = os.path.join(DATA_DIR, f"{symbol}_5m.csv")
+            df.to_csv(output_path, index=False)
 
             print(f"   ✓ Guardado en {output_path}\n")
 
