@@ -1,104 +1,119 @@
-# scripts/update_incremental.py
-
 import os
 import sys
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
-# Importamos binance_fetch
+# Importar función de Binance
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from utils.binance_fetch import get_binance_5m_data
+from utils.binance_fetch import get_binance_5m_data_between
 
-# === CONFIGURACIÓN ===
+# Símbolos
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
-DATA_DIR = "/data"
-MAX_ROWS = 900   # Mantener 3 días
+
+# Credenciales
+SERVICE_JSON = os.getenv("GOOGLE_CREDS_BASE64")
+SHEET_ID     = os.getenv("GOOGLE_SHEET_ID")
+
+if SERVICE_JSON is None:
+    raise RuntimeError("Falta la variable GOOGLE_SERVICE_ACCOUNT_JSON")
+if SHEET_ID is None:
+    raise RuntimeError("Falta la variable GOOGLE_SHEET_ID")
+
+# Crear credenciales
+creds = Credentials.from_service_account_info(
+    eval(SERVICE_JSON),
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+
+gc = gspread.authorize(creds)
+sh = gc.open_by_key(SHEET_ID)
 
 
-def load_existing(symbol):
+# ===========================================================
+# Función para leer la última vela desde Google Sheets
+# ===========================================================
+def get_last_open_time_ms(ws):
     """
-    Carga el CSV del símbolo y valida columnas necesarias.
+    Obtiene el valor UTC de la última vela en la hoja.
+    Retorna last_close_time_ms (int)
     """
-    path = os.path.join(DATA_DIR, f"{symbol}_5m.csv")
+    data = ws.get_all_records()
+    if len(data) == 0:
+        return None
 
-    if not os.path.exists(path):
-        print(f"⚠ No existe historial para {symbol}.")
-        return None, path
+    df = pd.DataFrame(data)
 
-    df = pd.read_csv(path)
+    # Asegurar columna existente
+    if "Open time UTC" not in df.columns:
+        raise RuntimeError(f"La hoja {ws.title} no tiene la columna 'Open time UTC'")
 
-    # Convertir timestamps importantes
-    if "Close time UTC" not in df.columns:
-        raise RuntimeError(f"{symbol}: Falta columna 'Close time UTC' en el CSV.")
-
-    df["Close time UTC"] = pd.to_datetime(df["Close time UTC"], utc=True)
-
-    df.sort_values("Close time UTC", inplace=True)
-
-    return df, path
+    last_ts = pd.to_datetime(df["Open time UTC"].iloc[-1], utc=True)
+    return int(last_ts.timestamp() * 1000)
 
 
-
-def update_symbol(symbol):
-    print(f"\n🔄 Actualizando {symbol}...")
-
-    df_old, path = load_existing(symbol)
-    if df_old is None:
-        return
-
-    # Última vela registrada
-    last_close = df_old["Close time UTC"].iloc[-1]
-    last_close_ms = int(last_close.timestamp() * 1000)
-
-    print(f"Última vela registrada: {last_close}")
-
-    # =============================
-    # DESCARGA INCREMENTAL
-    # =============================
-    print(f"Solicitando velas nuevas desde {last_close_ms + 1} ...")
-
-    df_new = get_binance_5m_data(
-        symbol,
-        start_ms=last_close_ms + 1
-    )
-
+# ===========================================================
+# Función para agregar nuevas velas al Google Sheet
+# ===========================================================
+def append_new_rows(ws, df_new):
+    """
+    Agrega nuevas velas al Google Sheet sin duplicar
+    """
     if df_new.empty:
-        print("✔ No hay velas nuevas.")
+        print(f"   → No hay velas nuevas.")
         return
 
-    # Convertir timestamps
-    df_new["Close time UTC"] = pd.to_datetime(df_new["Close time UTC"], utc=True)
+    # Convertir a listas de strings
+    values = df_new.astype(str).values.tolist()
 
-    # Filtrar duplicados
-    df_new = df_new[df_new["Close time UTC"] > last_close]
+    # Append al final del sheet
+    ws.append_rows(values, value_input_option="RAW")
 
-    if df_new.empty:
-        print("✔ Las velas recibidas eran duplicadas.")
-        return
-
-    print(f"📈 Velas nuevas recibidas: {len(df_new)}")
-
-    # =============================
-    # CONCATENAR Y LIMITAR A 900
-    # =============================
-    df_final = pd.concat([df_old, df_new], ignore_index=True)
-
-    if len(df_final) > MAX_ROWS:
-        df_final = df_final.iloc[-MAX_ROWS:]
-
-    df_final.to_csv(path, index=False)
-
-    print(f"💾 Guardado → {path}")
+    print(f"   ✓ {len(df_new)} velas nuevas agregadas.")
 
 
+# ===========================================================
+# MAIN DEL INCREMENTAL
+# ===========================================================
 def main():
-    print("\n🚀 Ejecutando actualización incremental 5m...\n")
+    print("\n🔄 === INCREMENTAL 5M ===\n")
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-
+    # Hora actual del servidor se obtiene dentro de get_binance_5m_data_between()
     for symbol in SYMBOLS:
-        update_symbol(symbol)
+        print(f"\n➡️ Procesando {symbol}…")
 
-    print("\n🎉 Incremental finalizado.\n")
+        try:
+            ws = sh.worksheet(symbol)
+        except Exception as e:
+            print(f"❌ No existe la hoja {symbol}: {e}")
+            continue
+
+        # 1. Obtener la última hora
+        last_open_ms = get_last_open_time_ms(ws)
+
+        if last_open_ms is None:
+            print(f"❌ La hoja {symbol} no tiene datos. Debe correr initialize_history_total.py primero.")
+            continue
+
+        # Convertir a fecha string para usar en get_between
+        last_dt = pd.to_datetime(last_open_ms, unit="ms", utc=True)
+        start_dt_str = last_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"   Última vela en hoja: {start_dt_str} UTC")
+
+        # 2. Obtener velas nuevas (después de la última vela)
+        df_new = get_binance_5m_data_between(
+            symbol,
+            start_dt_str
+        )
+
+        # 3. Remover la primera fila (porque es la última ya existente)
+        df_new = df_new.iloc[1:].copy()
+
+        # 4. Append a Google Sheets
+        append_new_rows(ws, df_new)
+
+    print("\n🎉 Incremental completado.\n")
 
 
 if __name__ == "__main__":
