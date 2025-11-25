@@ -6,72 +6,29 @@ import streamlit.components.v1 as components
 
 # --- IMPORTACIONES PERSONALIZADAS ---
 from utils.indicators import calcular_momentum_fisico_speed
-from utils.binance_fetch import get_binance_5m_data
 from utils.signal_postprocessing import limpiar_señales_consecutivas
+from utils.load_from_sheets import load_symbol_df
 
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Cripto Señales Multi-Token (5m)", layout="wide")
 st.title("📊 Señales Automatizadas por Token — 5m Momentum Físico")
 
-# 🔄 Refrescar cada 5 minutos (300,000 ms)
 st_autorefresh(interval=300000, key="auto_refresh_5m")
 
 symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
-# ==========================================================
-# 🎯 PARÁMETROS ÓPTIMOS POR SÍMBOLO (según tu grid search)
-# ==========================================================
 SYMBOL_PARAMS = {
-    "BTCUSDT": {
-        "mom_win": 4,
-        "speed_win": 9,
-        "accel_win": 7,
-        "zspeed_min": 0.3,
-        "zaccel_min": 0.1,
-    },
-    "ETHUSDT": {
-        "mom_win": 7,
-        "speed_win": 9,
-        "accel_win": 9,
-        "zspeed_min": 0.3,
-        "zaccel_min": 0.2,
-    },
-    "ADAUSDT": {
-        "mom_win": 4,
-        "speed_win": 7,
-        "accel_win": 5,
-        "zspeed_min": 0.2,
-        "zaccel_min": 0.3,
-    },
-    "XRPUSDT": {
-        "mom_win": 5,
-        "speed_win": 7,
-        "accel_win": 9,
-        "zspeed_min": 0.2,
-        "zaccel_min": 0.0,
-    },
-    "BNBUSDT": {
-        "mom_win": 6,
-        "speed_win": 7,
-        "accel_win": 9,
-        "zspeed_min": 0.3,
-        "zaccel_min": 0.0,
-    }
+    "BTCUSDT": {"mom_win": 4, "speed_win": 9, "accel_win": 7, "zspeed_min": 0.3, "zaccel_min": 0.1},
+    "ETHUSDT": {"mom_win": 7, "speed_win": 9, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.2},
+    "ADAUSDT": {"mom_win": 4, "speed_win": 7, "accel_win": 5, "zspeed_min": 0.2, "zaccel_min": 0.3},
+    "XRPUSDT": {"mom_win": 5, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.2, "zaccel_min": 0.0},
+    "BNBUSDT": {"mom_win": 6, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.0},
 }
 
-HISTORY_LIMIT_5M = 900  # ~3 días de velas
-
-
-# ==========================================================
-# 🔧 FUNCIÓN PARA PROCESAR CADA TOKEN
-# ==========================================================
 def procesar_symbol(symbol):
-    # 1) Descargar histórico 5m
-    df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M)
+    df = load_symbol_df(symbol)
 
-    # 2) Parámetros específicos para este símbolo
     params = SYMBOL_PARAMS.get(symbol)
-
     df = calcular_momentum_fisico_speed(
         df,
         mom_win=params["mom_win"],
@@ -81,121 +38,92 @@ def procesar_symbol(symbol):
         zaccel_min=params["zaccel_min"]
     )
 
-    # 3) Limpiar señales consecutivas
     df = limpiar_señales_consecutivas(df, columna='Momentum Signal')
-
     return df
 
-
-# ==========================================================
-# 🔹 MOSTRAR ÚLTIMA SEÑAL POR TOKEN
-# ==========================================================
+# ==============================
+# ÚLTIMAS SEÑALES
+# ==============================
 st.markdown("### 🔹 Últimas Señales por Token (5m)")
 
 for symbol in symbols:
     df = procesar_symbol(symbol)
-
     df_valid = df.dropna(subset=['Signal Final'])
+
     if df_valid.empty:
         st.info(f"Sin señales aún para {symbol}.")
         continue
 
-    ultima_fila = df_valid.iloc[-1]
-    ultima_senal = ultima_fila['Signal Final']
-    fecha_ultima = ultima_fila['Open time']
+    ultima = df_valid.iloc[-1]
 
-    if ultima_senal == 'BUY':
-        color = '#90EE90'  # verde claro
-        emoji = '🟢'
-        texto_color = '#000000'
-    elif ultima_senal == 'SELL':
-        color = '#FF7F7F'  # rojo claro
-        emoji = '🔴'
-        texto_color = '#FFFFFF'
+    senal = ultima['Signal Final']
+    fecha = ultima['Open time']
+
+    if senal == "BUY":
+        bg, color, emoji = "#90EE90", "#000", "🟢"
+    elif senal == "SELL":
+        bg, color, emoji = "#FF7F7F", "#FFF", "🔴"
     else:
-        color = '#D3D3D3'
-        emoji = '⏸️'
-        texto_color = '#000000'
+        bg, color, emoji = "#D3D3D3", "#000", "⏸️"
 
     st.markdown(f"""
-    <div style="background-color: {color}; 
-                color: {texto_color};
-                padding: 10px 18px; 
-                border-radius: 10px; 
-                font-size: 16px; 
-                margin-bottom: 10px">
-        🔹 <strong>{symbol}:</strong> {emoji} {ultima_senal} <br>
-        🗓️ <strong>Fecha:</strong> {fecha_ultima}
+    <div style="background:{bg};color:{color};
+         padding:12px;border-radius:10px;margin-bottom:10px;">
+         <b>{symbol}</b> {emoji} {senal}<br>
+         <small>{fecha}</small>
     </div>
     """, unsafe_allow_html=True)
 
-
-# ==========================================================
-# 📊 GRÁFICOS POR TOKEN
-# ==========================================================
-st.markdown("### 📊 Gráficos de Señales por Token (últimos 3 días, 5m)")
+# ==============================
+# GRÁFICOS
+# ==============================
+st.markdown("### 📊 Gráficos de Señales (últimos 3 días)")
 
 for symbol in symbols:
     df = procesar_symbol(symbol)
 
-    # Filtrar últimos 3 días
-    tz = df['Open time'].dt.tz
-    fecha_limite = pd.Timestamp.now(tz=tz) - pd.Timedelta(days=3)
-    df_filtrado = df[df['Open time'] >= fecha_limite].copy()
+    fecha_lim = pd.Timestamp.now(tz=df["Open time"].dt.tz) - pd.Timedelta(days=3)
+    dff = df[df["Open time"] >= fecha_lim]
 
-    if df_filtrado.empty:
-        st.warning(f"No hay datos en ventana de 3 días para {symbol}.")
+    if dff.empty:
+        st.warning(f"No hay datos recientes para {symbol}.")
         continue
 
-    # Preparar gráfico
     fig = go.Figure()
 
-    # Velas
     fig.add_trace(go.Candlestick(
-        x=df_filtrado['Open time'],
-        open=df_filtrado['Open'], high=df_filtrado['High'],
-        low=df_filtrado['Low'], close=df_filtrado['Close'],
-        name='Candlestick'
+        x=dff['Open time'],
+        open=dff['Open'], high=dff['High'],
+        low=dff['Low'], close=dff['Close']
     ))
 
-    # Señales filtradas
-    df_filtrado['prev_signal'] = df_filtrado['Signal Final'].shift(1)
+    dff["prev"] = dff["Signal Final"].shift(1)
 
-    # BUY
-    for _, row in df_filtrado[(df_filtrado['Signal Final']=='BUY') &
-                              (df_filtrado['prev_signal']!='BUY')].iterrows():
-        fig.add_trace(go.Scatter(
-            x=[row['Open time']], y=[row['Low']],
-            mode='text', text=["🟢BUY"],
-            textposition="bottom center", showlegend=False
-        ))
+    buys = dff[(dff["Signal Final"]=="BUY") & (dff["prev"]!="BUY")]
+    sells = dff[(dff["Signal Final"]=="SELL") & (dff["prev"]!="SELL")]
 
-    # SELL
-    for _, row in df_filtrado[(df_filtrado['Signal Final']=='SELL') &
-                              (df_filtrado['prev_signal']!='SELL')].iterrows():
-        fig.add_trace(go.Scatter(
-            x=[row['Open time']], y=[row['High']],
-            mode='text', text=["🔴SELL"],
-            textposition="top center", showlegend=False
-        ))
+    fig.add_trace(go.Scatter(
+        x=buys["Open time"], y=buys["Low"],
+        mode="text", text="🟢BUY"
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=sells["Open time"], y=sells["High"],
+        mode="text", text="🔴SELL"
+    ))
 
     fig.update_layout(
-        height=500,
-        title=f"Señales — {symbol} (5m Momentum Físico)",
-        showlegend=False,
-        xaxis_rangeslider_visible=False,
         template="plotly_dark",
-        hovermode="x unified"
+        xaxis_rangeslider_visible=False,
+        height=500,
+        title=f"{symbol} — Señales 5m"
     )
 
     st.plotly_chart(fig, use_container_width=True)
 
-
-# ==========================================================
-# TRADINGVIEW (opcional)
-# ==========================================================
-st.markdown("### 📊 Visualización en TradingView (BTCUSDT)")
+# TradingView
+st.markdown("### BTCUSDT — TradingView")
 components.html("""
-<iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark" 
-    width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no"></iframe>
+<iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
+width="100%" height="500"></iframe>
 """, height=500)
