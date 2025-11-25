@@ -129,6 +129,77 @@ def get_binance_4h_data(symbol: str, limit: int = 300, preferred_base: str = Non
 
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
 
+def get_binance_5m_data(symbol: str, limit: int = 900, preferred_base: str = None) -> pd.DataFrame:
+    """
+    Descarga velas 5m desde MIRROR/.US.
+    - limit≈900 → ~3 días de histórico (3d * 24h * 12 velas/h = 864)
+    - preferred_base: mismo concepto que en 4h para alinear con la base usada en la "última cerrada".
+    """
+    # Limitamos por seguridad
+    limit = max(100, min(int(limit), 1000))
+    bases = _bases_for(symbol)
+
+    # Probar primero la base preferida (la usada en la última cerrada)
+    if preferred_base and preferred_base in bases:
+        bases = [preferred_base] + [b for b in bases if b != preferred_base]
+
+    last_exc = None
+    print(f"[binance_fetch] {symbol} 5m → probando bases en orden: {bases}")
+    for base in [b for b in bases if b]:
+        try:
+            data = _fetch_klines(base, symbol, "5m", limit)
+            cols = [
+                "Open time","Open","High","Low","Close","Volume",
+                "Close time","Quote asset volume","Number of trades",
+                "Taker buy base asset volume","Taker buy quote asset volume","Ignore"
+            ]
+            df = pd.DataFrame(data, columns=cols)
+
+            # 1) Numéricos
+            for c in ["Open","High","Low","Close","Volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # 2) Tiempos (UTC)
+            df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
+            df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
+
+            # 3) Tiempos en CR (visual)
+            df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
+            df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
+
+            # 4) Orden por tiempo
+            df = df.sort_values("Open time UTC").reset_index(drop=True)
+
+            _PREFERRED_BASE[symbol] = base
+            print(f"[binance_fetch] {symbol} 5m ✓ usando base: {base}")
+            return df
+
+        except Exception as e:
+            print(f"[binance_fetch] {symbol} 5m ✗ fallo con {base}: {e}")
+            last_exc = e
+            continue
+
+    raise last_exc or RuntimeError(f"No se pudo obtener klines 5m para {symbol}")
+
+
+# =========================
+# NUEVO: ajuste para 5 minutos!
+# =========================
+
+
+FIVE_MIN_MS = 5 * 60 * 1000  # 5 minutos en ms
+
+def _floor_interval_utc(ts_ms: int, interval_ms: int) -> int:
+    return (ts_ms // interval_ms) * interval_ms
+
+def last_closed_window_5m(server_time_ms: int):
+    """
+    Última vela 5m CERRADA (UTC): [open_ms, close_ms)
+    """
+    last_close = _floor_interval_utc(server_time_ms, FIVE_MIN_MS)
+    last_open  = last_close - FIVE_MIN_MS
+    return last_open, last_close
+
 
 
 # =========================
@@ -180,5 +251,40 @@ def fetch_last_closed_kline(symbol: str, base_url: str, session=None):
     # hint de base preferida al tener éxito
     _PREFERRED_BASE[symbol] = base_url
     return k, last_open, last_close, server_time_ms
+
+def fetch_last_closed_kline_5m(symbol: str, base_url: str, session=None):
+    """
+    Pide exactamente la última vela 5m CERRADA vía REST,
+    apuntando con endTime=last_close-1 para evitar velas en formación.
+    Devuelve: (kline, last_open_ms, last_close_ms, server_time_ms)
+    """
+    s = session or _session
+
+    # 1) Hora del servidor (UTC)
+    r = s.get(f"{base_url}/api/v3/time", headers=_HEADERS, timeout=5)
+    r.raise_for_status()
+    server_time_ms = r.json()["serverTime"]
+
+    # 2) Ventana de la vela cerrada 5m
+    last_open, last_close = last_closed_window_5m(server_time_ms)
+
+    # 3) Kline cerrada apuntando a endTime=last_close-1 (inclusivo)
+    params = dict(symbol=symbol, interval="5m", limit=1, endTime=last_close - 1)
+    r = s.get(f"{base_url}/api/v3/klines", params=params, headers=_HEADERS, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        raise RuntimeError(f"[{symbol}] Sin datos de kline 5m desde {base_url}")
+
+    k = data[0]
+    k_open = int(k[0])
+    if k_open != last_open:
+        raise RuntimeError(f"[{symbol}] {base_url} 5m devolvió open={k_open}, esperado={last_open}")
+
+    # hint de base preferida
+    _PREFERRED_BASE[symbol] = base_url
+    return k, last_open, last_close, server_time_ms
+
+
 
 
