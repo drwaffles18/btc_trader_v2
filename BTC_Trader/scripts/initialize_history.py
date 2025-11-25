@@ -1,5 +1,5 @@
 # scripts/initialize_history.py
-# Descarga 3 días de velas 5m de Binance y guarda un archivo por símbolo en /data
+# Descarga 3 días de velas 5m de Binance y guarda un archivo por símbolo en Google Sheets
 
 import os
 import sys
@@ -9,36 +9,36 @@ import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.binance_fetch import get_binance_5m_data
+from utils.google_sheets import write_sheet
 
 # === CONFIGURACIÓN ===
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 HISTORY_LIMIT_5M = 900  # 3 días de velas
 
-# 🚀 Muy importante: usar el volumen real
-DATA_DIR = "/data"
+# GOOGLE SHEETS
+SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
 
 def main():
-    print("🔥 Iniciando descarga de histórico 5m (3 días)...\n")
-
-    # Crear directorio /data si no existe
-    os.makedirs(DATA_DIR, exist_ok=True)
+    print("🔥 Iniciando carga de histórico 5m hacia Google Sheets...\n")
 
     for symbol in SYMBOLS:
         try:
             print(f"➡️ Descargando {symbol}...")
             df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M)
 
-            # Guardar a CSV dentro del volumen /data
-            output_path = os.path.join(DATA_DIR, f"{symbol}_5m.csv")
-            df.to_csv(output_path, index=False)
+            # Nombre de la pestaña en Google Sheets
+            sheet_name = f"{symbol}_5m"
 
-            print(f"   ✓ Guardado en {output_path}\n")
+            # Escribir DataFrame completo a Google Sheets
+            write_sheet(SHEET_ID, sheet_name, df)
+
+            print(f"   ✓ Guardado en pestaña: {sheet_name}\n")
 
         except Exception as e:
-            print(f"   ❌ Error descargando {symbol}: {e}\n")
+            print(f"   ❌ Error descargando/escribiendo {symbol}: {e}\n")
 
-    print("🎉 Finalizado. Los archivos están en /data")
+    print("🎉 Histórico cargado completamente en Google Sheets.")
 
 
 if __name__ == "__main__":
