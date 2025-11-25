@@ -1,3 +1,10 @@
+import sys
+import os
+
+# Agregar el root real del proyecto (BTC_Trader) al PYTHONPATH
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(ROOT)
+
 import pandas as pd
 import time
 from utils.google_client import get_gsheet_client
