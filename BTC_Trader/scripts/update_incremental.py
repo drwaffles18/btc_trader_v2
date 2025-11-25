@@ -12,7 +12,7 @@ from utils.binance_fetch import get_binance_5m_data_between
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
 # Credenciales
-SERVICE_JSON = os.getenv("GOOGLE_CREDS_BASE64")
+SERVICE_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 SHEET_ID     = os.getenv("GOOGLE_SHEET_ID")
 
 if SERVICE_JSON is None:
