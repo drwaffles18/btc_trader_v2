@@ -13,7 +13,7 @@ from utils.binance_fetch import get_binance_5m_data
 # === CONFIGURACIÓN ===
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 HISTORY_LIMIT_5M = 900  # 3 días de velas
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+DATA_DIR = DATA_DIR = "/data"
 
 
 def main():
