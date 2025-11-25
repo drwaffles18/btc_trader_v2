@@ -285,6 +285,135 @@ def fetch_last_closed_kline_5m(symbol: str, base_url: str, session=None):
     _PREFERRED_BASE[symbol] = base_url
     return k, last_open, last_close, server_time_ms
 
+# =============================================================
+# NUEVO: Descarga histórico completo 5m entre fechas
+# =============================================================
+import time
+from datetime import datetime, timezone
+
+def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
+    """
+    Descarga TODO el histórico 5m entre start_dt y end_dt usando paginación automática.
+
+    Ejemplo:
+        df = get_binance_5m_data_between("BTCUSDT", "2024-12-01 00:00:00")
+
+    Parámetros:
+        symbol   : símbolo de Binance ej. "BTCUSDT"
+        start_dt : fecha inicial en formato "YYYY-MM-DD HH:MM:SS"
+        end_dt   : fecha final. Si es None → usa hora actual del servidor Binance
+
+    Retorna:
+        pandas.DataFrame con TODAS las velas entre start_dt y end_dt
+    """
+
+    # 1) Convertir fechas a milisegundos UTC
+    start_ms = int(pd.Timestamp(start_dt, tz="UTC").timestamp() * 1000)
+
+    # 2) Si no se da end_dt, pedir hora de servidor Binance
+    if end_dt is None:
+        r = _session.get(f"{US_HOST}/api/v3/time", timeout=5, headers=_HEADERS)
+        r.raise_for_status()
+        server_time = r.json()["serverTime"]
+        end_ms = int(server_time)
+    else:
+        end_ms = int(pd.Timestamp(end_dt, tz="UTC").timestamp() * 1000)
+
+    print(f"[binance_fetch] HISTÓRICO {symbol} 5m → desde {start_dt} hasta {pd.to_datetime(end_ms, unit='ms')}")
+    print(f"[binance_fetch] bases: {_bases_for(symbol)}")
+
+    frames = []
+    fetch_size = 1000
+    current_start = start_ms
+
+    bases = _bases_for(symbol)
+
+    while current_start < end_ms:
+
+        current_end = min(current_start + fetch_size * FIVE_MIN_MS, end_ms)
+
+        # Intento de fetch con fallback bases
+        last_exc = None
+        data = None
+
+        for base in bases:
+            try:
+                url = f"{base}/api/v3/klines"
+                params = {
+                    "symbol": symbol,
+                    "interval": "5m",
+                    "startTime": current_start,
+                    "endTime": current_end - 1,
+                    "limit": 1000
+                }
+
+                resp = _session.get(url, params=params, timeout=10, headers=_HEADERS)
+
+                # Saltar bloqueos
+                if resp.status_code in (451, 403):
+                    raise requests.HTTPError(f"{resp.status_code} from {base}", response=resp)
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                if isinstance(data, list):
+                    _PREFERRED_BASE[symbol] = base
+                    break  # éxito
+
+                raise ValueError(f"Formato inesperado: {data}")
+
+            except Exception as e:
+                print(f"[binance_fetch] {symbol} 5m ✗ fallo con {base}: {e}")
+                last_exc = e
+                continue
+
+        if data is None:
+            raise last_exc
+
+        if len(data) == 0:
+            # No más velas en este rango → terminar
+            break
+
+        # Convertir a DataFrame
+        cols = [
+            "Open time","Open","High","Low","Close","Volume",
+            "Close time","Quote asset volume","Number of trades",
+            "Taker buy base asset volume","Taker buy quote asset volume","Ignore"
+        ]
+        df = pd.DataFrame(data, columns=cols)
+
+        # 1) Numéricos
+        for c in ["Open","High","Low","Close","Volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # 2) Tiempos UTC
+        df["Open time UTC"]  = pd.to_datetime(df["Open time"], unit="ms", utc=True)
+        df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
+
+        # 3) Tiempos CR
+        df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
+        df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
+
+        frames.append(df)
+
+        # Avanzar puntero
+        last_close_ms = int(df["Close time UTC"].iloc[-1].timestamp() * 1000)
+        current_start = last_close_ms + FIVE_MIN_MS
+
+        # Pausa ligera para no golpear el API
+        time.sleep(0.1)
+
+    if not frames:
+        raise RuntimeError(f"No se obtuvo historial 5m para {symbol}")
+
+    final_df = pd.concat(frames, ignore_index=True)
+    final_df = final_df.sort_values("Open time UTC").reset_index(drop=True)
+
+    print(f"[binance_fetch] ✓ obtenido histórico completo: {len(final_df)} velas.")
+    return final_df
+
+
+
 
 
 
