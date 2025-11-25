@@ -70,3 +70,54 @@ def calcular_momentum_integral_ajustado(df, window=6, umbral=0.005):
 
     return df
 
+
+# --- Momentum Físico tipo "speed" para 5m ---
+
+def calcular_momentum_fisico_speed(
+    df: pd.DataFrame,
+    mom_win: int,
+    speed_win: int,
+    accel_win: int
+) -> pd.DataFrame:
+
+    df = df.copy()
+
+    # 1) Momentum (primera derivada)
+    df["mom"] = df["Close"].diff()
+
+    # Suavizado del momentum
+    df["mom_smooth"] = df["mom"].rolling(mom_win, min_periods=1).mean()
+
+    # 2) Speed (derivada de mom_smooth)
+    df["speed"] = df["mom_smooth"].diff()
+
+    # Suavizado robusto de speed (mediana)
+    df["speed_smooth"] = df["speed"].rolling(speed_win, min_periods=1).median()
+
+    # 3) Accel (derivada de speed_smooth)
+    df["accel"] = df["speed_smooth"].diff()
+
+    # Suavizado robusto de accel (mediana)
+    df["accel_smooth"] = df["accel"].rolling(accel_win, min_periods=1).median()
+
+    # 4) Z-scores (normalización por volatilidad local)
+    std_speed = df["speed_smooth"].rolling(30).std()
+    std_accel = df["accel_smooth"].rolling(30).std()
+
+    std_speed = std_speed.replace(0, np.nan)
+    std_accel = std_accel.replace(0, np.nan)
+
+    df["zspeed"] = df["speed_smooth"] / std_speed
+    df["zaccel"] = df["accel_smooth"] / std_accel
+
+    # ⛔ NO BORRAMOS FILAS
+    df["zspeed"] = df["zspeed"].fillna(0)
+    df["zaccel"] = df["zaccel"].fillna(0)
+
+    df = df.reset_index(drop=True)
+
+    return df
+
+
+
+
