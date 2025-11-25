@@ -77,46 +77,63 @@ def calcular_momentum_fisico_speed(
     df: pd.DataFrame,
     mom_win: int,
     speed_win: int,
-    accel_win: int
+    accel_win: int,
+    zspeed_min: float,
+    zaccel_min: float
 ) -> pd.DataFrame:
 
     df = df.copy()
 
     # 1) Momentum (primera derivada)
     df["mom"] = df["Close"].diff()
-
-    # Suavizado del momentum
     df["mom_smooth"] = df["mom"].rolling(mom_win, min_periods=1).mean()
 
     # 2) Speed (derivada de mom_smooth)
     df["speed"] = df["mom_smooth"].diff()
-
-    # Suavizado robusto de speed (mediana)
     df["speed_smooth"] = df["speed"].rolling(speed_win, min_periods=1).median()
 
-    # 3) Accel (derivada de speed_smooth)
+    # 3) Acceleration
     df["accel"] = df["speed_smooth"].diff()
-
-    # Suavizado robusto de accel (mediana)
     df["accel_smooth"] = df["accel"].rolling(accel_win, min_periods=1).median()
 
-    # 4) Z-scores (normalización por volatilidad local)
-    std_speed = df["speed_smooth"].rolling(30).std()
-    std_accel = df["accel_smooth"].rolling(30).std()
+    # 4) Z-scores
+    std_speed = df["speed_smooth"].rolling(30).std().replace(0, np.nan)
+    std_accel = df["accel_smooth"].rolling(30).std().replace(0, np.nan)
 
-    std_speed = std_speed.replace(0, np.nan)
-    std_accel = std_accel.replace(0, np.nan)
+    df["zspeed"] = (df["speed_smooth"] / std_speed).fillna(0)
+    df["zaccel"] = (df["accel_smooth"] / std_accel).fillna(0)
 
-    df["zspeed"] = df["speed_smooth"] / std_speed
-    df["zaccel"] = df["accel_smooth"] / std_accel
+    # 5) Señales iniciales
+    df["Momentum Signal"] = None
 
-    # ⛔ NO BORRAMOS FILAS
-    df["zspeed"] = df["zspeed"].fillna(0)
-    df["zaccel"] = df["zaccel"].fillna(0)
+    df.loc[
+        (df["zspeed"] > zspeed_min) & (df["zaccel"] > zaccel_min),
+        "Momentum Signal"
+    ] = "BUY"
 
-    df = df.reset_index(drop=True)
+    df.loc[
+        (df["zspeed"] < -zspeed_min) & (df["zaccel"] < -zaccel_min),
+        "Momentum Signal"
+    ] = "SELL"
+
+    # 6) Limpiar señales consecutivas ("BUY BUY BUY" → solo 1)
+    df["Signal Final"] = None
+    last_signal = None
+
+    signals = []
+
+    for sig in df["Momentum Signal"]:
+        if sig != last_signal:
+            signals.append(sig)
+            last_signal = sig
+        else:
+            signals.append(None)
+
+    df["Signal Final"] = signals
 
     return df
+
+
 
 
 
