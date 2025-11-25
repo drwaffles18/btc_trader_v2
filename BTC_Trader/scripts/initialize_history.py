@@ -13,7 +13,9 @@ from utils.binance_fetch import get_binance_5m_data
 # === CONFIGURACIÓN ===
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 HISTORY_LIMIT_5M = 900  # 3 días de velas
-DATA_DIR = DATA_DIR = "/data"
+
+# 🚀 Muy importante: usar el volumen real
+DATA_DIR = "/data"
 
 
 def main():
@@ -27,7 +29,7 @@ def main():
             print(f"➡️ Descargando {symbol}...")
             df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M)
 
-            # Guardar a CSV (sin dependencias externas)
+            # Guardar a CSV dentro del volumen /data
             output_path = os.path.join(DATA_DIR, f"{symbol}_5m.csv")
             df.to_csv(output_path, index=False)
 
