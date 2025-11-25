@@ -13,10 +13,18 @@ from utils.binance_fetch import fetch_last_closed_kline_5m, bases_para
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
-
+# ==========================================
+# Normalizar timestamps correctamente
+# ==========================================
 def normalize_utc(ms):
-    """Convierte milisegundos UTC a datetime UTC y redondea a vela 5m."""
-    return pd.to_datetime(ms, unit="ms", utc=True).dt.floor("5min")
+    """Convierte timestamp en ms → UTC redondeado a 5m."""
+    ts = pd.to_datetime(ms, unit="ms", utc=True)
+    return ts.floor("5min")
+
+
+def append_rows(ws, df_new):
+    next_row = len(ws.get_all_values()) + 1
+    ws.update(f"A{next_row}", df_new.astype(str).values.tolist())
 
 
 def main():
@@ -28,21 +36,18 @@ def main():
     for symbol in SYMBOLS:
         print(f"\n➡️ {symbol}")
 
-        # 1. Cargar dataframe actual desde Google Sheets
         df = load_symbol_df(symbol)
 
-        # USAR SIEMPRE Close time UTC
-        if "Close time UTC" not in df.columns:
-            raise RuntimeError(f"❌ La hoja {symbol} no contiene 'Close time UTC'. Revisar histórico.")
+        # Normalizar último close en el sheet
+        last_close = normalize_utc(df["Close time"].max())
 
-        last_close_utc = df["Close time UTC"].max()
-
+        # abrir hoja
         try:
             ws = sh.worksheet(symbol)
         except:
             raise RuntimeError(f"❌ La hoja {symbol} no existe.")
 
-        # 2. Intentar descargar la última vela desde Binance
+        # intentar descargar desde varias bases
         for base in bases_para(symbol):
             try:
                 kline, open_ms, close_ms, _ = fetch_last_closed_kline_5m(symbol, base)
@@ -51,33 +56,30 @@ def main():
                 print(f"   ✗ {base} falló: {e}")
                 continue
 
-        # 3. Normalizar timestamps recibidos
+        # normalizar timestamps Binance
         k_open_utc = normalize_utc(open_ms)
         k_close_utc = normalize_utc(close_ms)
 
-        # 4. Comparación anti-duplicados usando UTC
-        if k_close_utc <= last_close_utc:
-            print(f"   ✓ No hay velas nuevas (última = {last_close_utc}, incremental = {k_close_utc}).")
+        # anti-duplicados estrictos
+        if k_close_utc <= last_close:
+            print(f"   ✓ No hay velas nuevas (última = {last_close}, incremental = {k_close_utc}).")
             continue
 
-        # 5. Construir fila nueva
+        # construir la fila
         row = {
-            "Open time UTC": k_open_utc,
+            "Open time": k_open_utc,
             "Open": float(kline[1]),
             "High": float(kline[2]),
             "Low": float(kline[3]),
             "Close": float(kline[4]),
             "Volume": float(kline[5]),
-            "Close time UTC": k_close_utc
+            "Close time": k_close_utc
         }
 
         df_new = pd.DataFrame([row])
+        append_rows(ws, df_new)
 
-        # 6. Insertar al final
-        next_row = len(ws.get_all_values()) + 1
-        ws.update(f"A{next_row}", df_new.astype(str).values.tolist())
-
-        print(f"   ✓ Agregada vela nueva: {k_close_utc}")
+        print(f"   ✓ Agregada nueva vela: {k_close_utc}")
 
     print("\n🎉 Incremental completado sin duplicados.")
 
