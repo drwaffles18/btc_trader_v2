@@ -5,41 +5,96 @@ from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
 
 # --- IMPORTACIONES PERSONALIZADAS ---
-from utils.indicators import calculate_indicators, calcular_momentum_integral
-from utils.binance_fetch import get_binance_4h_data
+from utils.indicators import calcular_momentum_fisico_speed
+from utils.binance_fetch import get_binance_5m_data
 from utils.signal_postprocessing import limpiar_señales_consecutivas
 
 # --- CONFIGURACIÓN INICIAL ---
-st.set_page_config(page_title="Cripto Señales Multi-Token", layout="wide")
-st.title("📊 Señales Automatizadas por Token")
+st.set_page_config(page_title="Cripto Señales Multi-Token (5m)", layout="wide")
+st.title("📊 Señales Automatizadas por Token — 5m Momentum Físico")
 
-# 🔄 Refrescar cada 10 minutos (600,000 ms)
-st_autorefresh(interval=600000, key="auto_refresh")
+# 🔄 Refrescar cada 5 minutos (300,000 ms)
+st_autorefresh(interval=300000, key="auto_refresh_5m")
 
-# --- PARÁMETROS ---
-# Agregamos BNBUSDT
 symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
-interval = "4h"
 
-# --- FUNCIÓN PARA PROCESAR CADA TOKEN ---
+# ==========================================================
+# 🎯 PARÁMETROS ÓPTIMOS POR SÍMBOLO (según tu grid search)
+# ==========================================================
+SYMBOL_PARAMS = {
+    "BTCUSDT": {
+        "mom_win": 4,
+        "speed_win": 9,
+        "accel_win": 7,
+        "zspeed_min": 0.3,
+        "zaccel_min": 0.1,
+    },
+    "ETHUSDT": {
+        "mom_win": 7,
+        "speed_win": 9,
+        "accel_win": 9,
+        "zspeed_min": 0.3,
+        "zaccel_min": 0.2,
+    },
+    "ADAUSDT": {
+        "mom_win": 4,
+        "speed_win": 7,
+        "accel_win": 5,
+        "zspeed_min": 0.2,
+        "zaccel_min": 0.3,
+    },
+    "XRPUSDT": {
+        "mom_win": 5,
+        "speed_win": 7,
+        "accel_win": 9,
+        "zspeed_min": 0.2,
+        "zaccel_min": 0.0,
+    },
+    "BNBUSDT": {
+        "mom_win": 6,
+        "speed_win": 7,
+        "accel_win": 9,
+        "zspeed_min": 0.3,
+        "zaccel_min": 0.0,
+    }
+}
+
+HISTORY_LIMIT_5M = 900  # ~3 días de velas
+
+
+# ==========================================================
+# 🔧 FUNCIÓN PARA PROCESAR CADA TOKEN
+# ==========================================================
 def procesar_symbol(symbol):
-    df = get_binance_4h_data(symbol)
-    df = calculate_indicators(df)
-    df = calcular_momentum_integral(df, window=6)
+    # 1) Descargar histórico 5m
+    df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M)
 
-    # IMPORTANTE: limpiar antes de usar y NO volver a pisar 'Signal Final'
-    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')  # crea/actualiza 'Signal Final'
-    # NO hacer: df['Signal Final'] = df['Momentum Signal']
+    # 2) Parámetros específicos para este símbolo
+    params = SYMBOL_PARAMS.get(symbol)
+
+    df = calcular_momentum_fisico_speed(
+        df,
+        mom_win=params["mom_win"],
+        speed_win=params["speed_win"],
+        accel_win=params["accel_win"],
+        zspeed_min=params["zspeed_min"],
+        zaccel_min=params["zaccel_min"]
+    )
+
+    # 3) Limpiar señales consecutivas
+    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')
 
     return df
 
-# --- MOSTRAR ÚLTIMA SEÑAL DE CADA TOKEN ---
-st.markdown("### 🔹 Últimas Señales por Token")
+
+# ==========================================================
+# 🔹 MOSTRAR ÚLTIMA SEÑAL POR TOKEN
+# ==========================================================
+st.markdown("### 🔹 Últimas Señales por Token (5m)")
 
 for symbol in symbols:
     df = procesar_symbol(symbol)
 
-    # Evitar errores si aún no hay señales válidas
     df_valid = df.dropna(subset=['Signal Final'])
     if df_valid.empty:
         st.info(f"Sin señales aún para {symbol}.")
@@ -58,7 +113,7 @@ for symbol in symbols:
         emoji = '🔴'
         texto_color = '#FFFFFF'
     else:
-        color = '#D3D3D3'  # gris claro
+        color = '#D3D3D3'
         emoji = '⏸️'
         texto_color = '#000000'
 
@@ -74,20 +129,25 @@ for symbol in symbols:
     </div>
     """, unsafe_allow_html=True)
 
-# --- MOSTRAR LOS GRÁFICOS ---
-st.markdown("### 📊 Gráficos de Señales por Token (últimos 30 días)")
+
+# ==========================================================
+# 📊 GRÁFICOS POR TOKEN
+# ==========================================================
+st.markdown("### 📊 Gráficos de Señales por Token (últimos 3 días, 5m)")
 
 for symbol in symbols:
     df = procesar_symbol(symbol)
 
-    # Filtrar solo datos de los últimos 30 días
-    fecha_limite = pd.Timestamp.now(tz=df['Open time'].dt.tz) - pd.Timedelta(days=30)
+    # Filtrar últimos 3 días
+    tz = df['Open time'].dt.tz
+    fecha_limite = pd.Timestamp.now(tz=tz) - pd.Timedelta(days=3)
     df_filtrado = df[df['Open time'] >= fecha_limite].copy()
 
     if df_filtrado.empty:
-        st.warning(f"No hay datos en ventana de 30 días para {symbol}.")
+        st.warning(f"No hay datos en ventana de 3 días para {symbol}.")
         continue
 
+    # Preparar gráfico
     fig = go.Figure()
 
     # Velas
@@ -98,23 +158,21 @@ for symbol in symbols:
         name='Candlestick'
     ))
 
-    # Señales: comparar contra la fila anterior DENTRO del filtrado
+    # Señales filtradas
     df_filtrado['prev_signal'] = df_filtrado['Signal Final'].shift(1)
 
-    # BUYs
-    mask_buy = (df_filtrado['Signal Final'] == 'BUY') & (df_filtrado['prev_signal'] != 'BUY')
-    buys = df_filtrado[mask_buy]
-    for _, row in buys.iterrows():
+    # BUY
+    for _, row in df_filtrado[(df_filtrado['Signal Final']=='BUY') &
+                              (df_filtrado['prev_signal']!='BUY')].iterrows():
         fig.add_trace(go.Scatter(
             x=[row['Open time']], y=[row['Low']],
             mode='text', text=["🟢BUY"],
             textposition="bottom center", showlegend=False
         ))
 
-    # SELLs
-    mask_sell = (df_filtrado['Signal Final'] == 'SELL') & (df_filtrado['prev_signal'] != 'SELL')
-    sells = df_filtrado[mask_sell]
-    for _, row in sells.iterrows():
+    # SELL
+    for _, row in df_filtrado[(df_filtrado['Signal Final']=='SELL') &
+                              (df_filtrado['prev_signal']!='SELL')].iterrows():
         fig.add_trace(go.Scatter(
             x=[row['Open time']], y=[row['High']],
             mode='text', text=["🔴SELL"],
@@ -123,15 +181,19 @@ for symbol in symbols:
 
     fig.update_layout(
         height=500,
-        title=f"Señales — {symbol}",
+        title=f"Señales — {symbol} (5m Momentum Físico)",
         showlegend=False,
         xaxis_rangeslider_visible=False,
-        template="plotly_dark"
+        template="plotly_dark",
+        hovermode="x unified"
     )
 
     st.plotly_chart(fig, use_container_width=True)
 
-# --- EMBED DE TRADINGVIEW ---
+
+# ==========================================================
+# TRADINGVIEW (opcional)
+# ==========================================================
 st.markdown("### 📊 Visualización en TradingView (BTCUSDT)")
 components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark" 
