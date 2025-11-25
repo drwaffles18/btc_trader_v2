@@ -11,12 +11,14 @@ from utils.load_from_sheets import load_symbol_df
 
 # --- CONFIGURACIÓN INICIAL ---
 st.set_page_config(page_title="Cripto Señales Multi-Token (5m)", layout="wide")
-st.title("📊 Señales Automatizadas por Token — 5m Momentum Físico")
+st.title("📊 Señales Automatizadas — Momentum Físico (5m)")
 
+# Auto refresh cada 5 minutos
 st_autorefresh(interval=300000, key="auto_refresh_5m")
 
 symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
+# --- PARÁMETROS POR TOKEN ---
 SYMBOL_PARAMS = {
     "BTCUSDT": {"mom_win": 4, "speed_win": 9, "accel_win": 7, "zspeed_min": 0.3, "zaccel_min": 0.1},
     "ETHUSDT": {"mom_win": 7, "speed_win": 9, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.2},
@@ -25,10 +27,15 @@ SYMBOL_PARAMS = {
     "BNBUSDT": {"mom_win": 6, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.0},
 }
 
+# ---------------------------------------
+# 🚀 CACHE INTELIGENTE PARA ACELERAR TODO
+# ---------------------------------------
+@st.cache_data(ttl=240)   # cache 4 minutos
 def procesar_symbol(symbol):
-    df = load_symbol_df(symbol)
+    """Carga el DF desde Sheets, calcula momentum físico y limpia señales consecutivas."""
+    df = load_symbol_df(symbol).copy()
 
-    params = SYMBOL_PARAMS.get(symbol)
+    params = SYMBOL_PARAMS[symbol]
     df = calcular_momentum_fisico_speed(
         df,
         mom_win=params["mom_win"],
@@ -38,90 +45,127 @@ def procesar_symbol(symbol):
         zaccel_min=params["zaccel_min"]
     )
 
-    df = limpiar_señales_consecutivas(df, columna='Momentum Signal')
+    # limpiar duplicados: BUY-BUY-BUY / SELL-SELL-SELL
+    df = limpiar_señales_consecutivas(df, columna="Momentum Signal")
+
     return df
 
+
 # ==============================
-# ÚLTIMAS SEÑALES
+# 🔹 ÚLTIMAS SEÑALES
 # ==============================
 st.markdown("### 🔹 Últimas Señales por Token (5m)")
 
 for symbol in symbols:
-    df = procesar_symbol(symbol)
-    df_valid = df.dropna(subset=['Signal Final'])
+    try:
+        df = procesar_symbol(symbol)
+        df_valid = df.dropna(subset=['Momentum Signal'])
 
-    if df_valid.empty:
-        st.info(f"Sin señales aún para {symbol}.")
-        continue
+        if df_valid.empty:
+            st.info(f"Sin señales aún para {symbol}.")
+            continue
 
-    ultima = df_valid.iloc[-1]
+        ultima = df_valid.iloc[-1]
+        senal = ultima["Momentum Signal"]
+        fecha = ultima["Open time"]
 
-    senal = ultima['Signal Final']
-    fecha = ultima['Open time']
+        # estilos por señal
+        if senal == "BUY":
+            bg, color, emoji = "#90EE90", "#000", "🟢"
+        elif senal == "SELL":
+            bg, color, emoji = "#FF7F7F", "#FFF", "🔴"
+        else:
+            bg, color, emoji = "#D3D3D3", "#000", "⏸️"
 
-    if senal == "BUY":
-        bg, color, emoji = "#90EE90", "#000", "🟢"
-    elif senal == "SELL":
-        bg, color, emoji = "#FF7F7F", "#FFF", "🔴"
-    else:
-        bg, color, emoji = "#D3D3D3", "#000", "⏸️"
+        st.markdown(f"""
+        <div style="background:{bg};color:{color};
+            padding:12px;border-radius:10px;margin-bottom:10px;">
+            <b>{symbol}</b> {emoji} {senal}<br>
+            <small>{fecha}</small>
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div style="background:{bg};color:{color};
-         padding:12px;border-radius:10px;margin-bottom:10px;">
-         <b>{symbol}</b> {emoji} {senal}<br>
-         <small>{fecha}</small>
-    </div>
-    """, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Error procesando {symbol}: {e}")
+
 
 # ==============================
-# GRÁFICOS
+# 📊 GRÁFICOS
 # ==============================
-st.markdown("### 📊 Gráficos de Señales (últimos 3 días)")
+st.markdown("### 📊 Gráficos de Señales (últimas 180 velas)")
+
+MAX_VELAS = 180
 
 for symbol in symbols:
-    df = procesar_symbol(symbol)
+    try:
+        df = procesar_symbol(symbol)
+        dff = df.tail(MAX_VELAS).copy()
 
-    fecha_lim = pd.Timestamp.now(tz=df["Open time"].dt.tz) - pd.Timedelta(days=3)
-    dff = df[df["Open time"] >= fecha_lim]
+        if dff.empty:
+            st.warning(f"No hay datos recientes para {symbol}.")
+            continue
 
-    if dff.empty:
-        st.warning(f"No hay datos recientes para {symbol}.")
-        continue
+        # evitar warnings pandas
+        dff = dff.copy()
+        dff.loc[:, "prev"] = dff["Momentum Signal"].shift(1)
 
-    fig = go.Figure()
+        buys = dff[(dff["Momentum Signal"] == "BUY") & (dff["prev"] != "BUY")]
+        sells = dff[(dff["Momentum Signal"] == "SELL") & (dff["prev"] != "SELL")]
 
-    fig.add_trace(go.Candlestick(
-        x=dff['Open time'],
-        open=dff['Open'], high=dff['High'],
-        low=dff['Low'], close=dff['Close']
-    ))
+        fig = go.Figure()
 
-    dff["prev"] = dff["Signal Final"].shift(1)
+        # --- Candlesticks ---
+        fig.add_trace(go.Candlestick(
+            name=f"{symbol} Price",
+            x=dff['Open time'],
+            open=dff['Open'], high=dff['High'],
+            low=dff['Low'], close=dff['Close']
+        ))
 
-    buys = dff[(dff["Signal Final"]=="BUY") & (dff["prev"]!="BUY")]
-    sells = dff[(dff["Signal Final"]=="SELL") & (dff["prev"]!="SELL")]
+        # --- Señales ---
+        fig.add_trace(go.Scatter(
+            name="BUY",
+            x=buys["Open time"],
+            y=buys["Low"] * 0.999,
+            mode="text",
+            text="🟢 BUY"
+        ))
+        fig.add_trace(go.Scatter(
+            name="SELL",
+            x=sells["Open time"],
+            y=sells["High"] * 1.001,
+            mode="text",
+            text="🔴 SELL"
+        ))
 
-    fig.add_trace(go.Scatter(
-        x=buys["Open time"], y=buys["Low"],
-        mode="text", text="🟢BUY"
-    ))
+        # --- Crosshair estilo TradingView ---
+        fig.update_layout(
+            template="plotly_dark",
+            xaxis_rangeslider_visible=False,
+            height=480,
+            title=f"{symbol} — Señales 5m (últimas {MAX_VELAS} velas)",
+            hovermode="x unified",
+            xaxis=dict(
+                showspikes=True, spikemode="across",
+                spikesnap="cursor", spikethickness=1,
+                spikecolor="#888", showline=True
+            ),
+            yaxis=dict(
+                showspikes=True, spikemode="across",
+                spikesnap="cursor", spikethickness=1,
+                spikecolor="#888", showline=True
+            )
+        )
 
-    fig.add_trace(go.Scatter(
-        x=sells["Open time"], y=sells["High"],
-        mode="text", text="🔴SELL"
-    ))
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig.update_layout(
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        height=500,
-        title=f"{symbol} — Señales 5m"
-    )
+    except Exception as e:
+        st.error(f"Error graficando {symbol}: {e}")
 
-    st.plotly_chart(fig, use_container_width=True)
 
-# TradingView
+# ==============================
+# 📈 TRADINGVIEW
+# ==============================
 st.markdown("### BTCUSDT — TradingView")
 components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
