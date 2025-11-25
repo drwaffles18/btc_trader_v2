@@ -10,3 +10,9 @@ altair==4.2.2
 scikit-learn==1.3.2
 streamlit-autorefresh
 python-binance==1.0.17
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+
