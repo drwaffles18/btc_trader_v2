@@ -1,10 +1,11 @@
 import sys
 import os
+import pandas as pd
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# Fix import paths
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(ROOT)
 
-import pandas as pd
 from utils.google_client import get_gsheet_client
 from utils.load_from_sheets import load_symbol_df
 from utils.binance_fetch import fetch_last_closed_kline_5m, bases_para
@@ -12,11 +13,14 @@ from utils.binance_fetch import fetch_last_closed_kline_5m, bases_para
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
+def normalize(dt):
+    """Normaliza timestamp eliminando milisegundos y zonas inconsistentes."""
+    return pd.to_datetime(dt, utc=True).floor("5min")
 
-def append_rows(ws, df_new: pd.DataFrame):
-    existing = len(ws.get_all_values())
-    ws.update(f"A{existing+1}", df_new.astype(str).values.tolist())
-
+def append_rows(ws, df_new):
+    # insertar al final
+    next_row = len(ws.get_all_values()) + 1
+    ws.update(f"A{next_row}", df_new.astype(str).values.tolist())
 
 def main():
     print("🔄 Iniciando actualización incremental...")
@@ -27,57 +31,51 @@ def main():
     for symbol in SYMBOLS:
         print(f"\n➡️ {symbol}")
 
-        # 1) Cargar histórico actual y tomar el ÚLTIMO OPEN TIME
+        # cargar df local desde gsheets
         df = load_symbol_df(symbol)
-        last_open = df["Open time"].max()
+        last_close = normalize(df["Close time"].max())
 
         try:
             ws = sh.worksheet(symbol)
-        except Exception:
-            raise RuntimeError(f"❌ La hoja {symbol} no existe en Google Sheets.")
+        except:
+            raise RuntimeError(f"❌ La hoja {symbol} no existe.")
 
-        # 2) Pedir la última vela 5m cerrada a Binance
-        kline = None
+        # intentar descargar desde varias bases
         for base in bases_para(symbol):
             try:
-                k, open_ms, close_ms, _ = fetch_last_closed_kline_5m(symbol, base)
-                kline = k
+                kline, open_ms, close_ms, _ = fetch_last_closed_kline_5m(symbol, base)
                 break
             except Exception as e:
                 print(f"   ✗ {base} falló: {e}")
                 continue
 
-        if kline is None:
-            print("   ❌ No se pudo obtener la última vela.")
+        # normalizar timestamps
+        k_close = normalize(close_ms)
+        k_open  = normalize(open_ms)
+
+        # anti-duplicados estrictos
+        if k_close <= last_close:
+            print(f"   ✓ No hay velas nuevas (última = {last_close}, incremental = {k_close}).")
             continue
 
-        # 3) Tiempos en zona horaria CR
-        k_open_time = pd.to_datetime(kline[0], unit="ms", utc=True).tz_convert("America/Costa_Rica")
-        k_close_time = pd.to_datetime(kline[6], unit="ms", utc=True).tz_convert("America/Costa_Rica")
-
-        # 4) Si ya tengo una vela con ese OPEN TIME, no hago nada
-        if k_open_time <= last_open:
-            print(f"   ✓ Sin nuevas velas (último open ya presente: {last_open})")
-            continue
-
-        # 5) Construir fila nueva
+        # construir fila nueva
         row = {
-            "Open time": k_open_time,
+            "Open time": k_open,
             "Open": float(kline[1]),
             "High": float(kline[2]),
             "Low": float(kline[3]),
             "Close": float(kline[4]),
             "Volume": float(kline[5]),
-            "Close time": k_close_time,
+            "Close time": k_close
         }
 
         df_new = pd.DataFrame([row])
+
         append_rows(ws, df_new)
 
-        print(f"   ✓ Agregada vela nueva (open={k_open_time}, close={k_close_time})")
+        print(f"   ✓ Agregada nueva vela: {k_close}")
 
-    print("\n🎉 Incremental completado.")
-
+    print("\n🎉 Incremental completado sin duplicados.")
 
 if __name__ == "__main__":
     main()
