@@ -128,15 +128,19 @@ for symbol in symbols:
             x=buys["Open time"],
             y=buys["Low"] * 0.999,
             mode="text",
-            text="🟢 BUY"
+            text="🟢 BUY",
+            showlegend=False        # 👈 oculta del legend
         ))
+
         fig.add_trace(go.Scatter(
             name="SELL",
             x=sells["Open time"],
             y=sells["High"] * 1.001,
             mode="text",
-            text="🔴 SELL"
+            text="🔴 SELL",
+            showlegend=False        # 👈 oculta del legend
         ))
+
 
         # --- Crosshair estilo TradingView ---
         fig.update_layout(
@@ -171,3 +175,4 @@ components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
 width="100%" height="500"></iframe>
 """, height=500)
+
