@@ -17,6 +17,7 @@ from utils.binance_fetch import (
 
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
+MAX_KEEP = 1200  # 🔥 límite global de filas
 
 CR = pytz.timezone("America/Costa_Rica")
 
@@ -25,35 +26,76 @@ CR = pytz.timezone("America/Costa_Rica")
 # Helpers
 # =====================================================
 
-def append_row(ws, df_new):
-    """Inserta UNA fila sin alterar strings."""
-    next_row = len(ws.get_all_values()) + 1
-    values = df_new.applymap(
-        lambda x: x if isinstance(x, str) else str(x)
-    ).values.tolist()
-    ws.update(values=values, range_name=f"A{next_row}")
+def ensure_capacity(ws, required_last_row: int) -> None:
+    """
+    Asegura que la hoja tenga al menos `required_last_row` filas en el grid.
+    Si no, agrega las filas necesarias con ws.add_rows().
+    """
+    current_rows = ws.row_count  # tamaño del grid (no datos)
+
+    if required_last_row > current_rows:
+        extra = required_last_row - current_rows
+        print(f"[ensure_capacity] Ampliando hoja: {current_rows} → {current_rows + extra} filas")
+        ws.add_rows(extra)
 
 
-def append_rows(ws, df_new):
-    """Inserta VARIAS filas sin alterar strings."""
-    next_row = len(ws.get_all_values()) + 1
-    values = df_new.applymap(
-        lambda x: x if isinstance(x, str) else str(x)
-    ).values.tolist()
+def purge_old_rows(ws, max_keep: int = 1200) -> None:
+    """
+    Mantiene como máximo `max_keep` filas con datos (incluyendo encabezado).
+
+    Mantiene:
+      - Fila 1: encabezado
+      - Fila 2: primer dato reciente
+      - Desde fila 3 borra todo lo extra si excede max_keep
+    """
+    used_rows = len(ws.col_values(1))  # número real de filas usadas
+
+    if used_rows <= max_keep:
+        return
+
+    excess = used_rows - max_keep
+    start_index = 3
+    end_index = start_index + excess - 1
+
+    print(f"[purge_old_rows] Podando filas {start_index} → {end_index} (total usadas: {used_rows})")
+
+    ws.delete_rows(start_index, end_index)
+
+
+def append_rows(ws, df, max_keep: int = 1200) -> None:
+    """
+    Inserta las filas de `df` al final de la hoja y aplica poda automática.
+    """
+    if df is None or df.empty:
+        print("[append_rows] DataFrame vacío, no se agrega nada")
+        return
+
+    values = df.values.tolist()
+
+    used_rows = len(ws.col_values(1))
+    next_row = used_rows + 1 if used_rows > 0 else 1
     end_row = next_row + len(values) - 1
-    ws.update(values=values, range_name=f"A{next_row}:G{end_row}")
+
+    # 1. Garantizar espacio
+    ensure_capacity(ws, end_row)
+
+    # 2. Escribir filas
+    range_name = f"A{next_row}:G{end_row}"
+    print(f"[append_rows] Insertando {len(values)} filas en {range_name}")
+    ws.update(range_name=range_name, values=values)
+
+    # 3. Podar si es necesario
+    purge_old_rows(ws, max_keep=max_keep)
 
 
 # =====================================================
 # GAP FIXER — versión FINAL
 # =====================================================
 
-def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base):
+def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base, max_keep=1200):
     """
-    Descarga TODAS las velas faltantes desde last_close_utc → next_open_utc,
-    utilizando SIEMPRE api.binance.com para asegurar datos reales.
+    Descarga TODAS las velas faltantes entre last_close_utc y next_open_utc.
     """
-
     expected_open = last_close_utc + pd.Timedelta(milliseconds=1)
     expected_open = expected_open.floor("5min")
 
@@ -61,12 +103,11 @@ def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base
         print(f"   ✓ {symbol}: sin gaps.")
         return
 
-    print(f"   ⚠️ {symbol}: Hay gaps → descargando histórico real...")
+    print(f"   ⚠️ {symbol}: Hay gaps → descargando velas reales...")
 
     start_str = expected_open.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
     end_str   = next_open_utc.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
 
-    # HISTÓRICO SOLO DESDE api.binance.com
     df_missing = get_binance_5m_data_between(
         symbol,
         start_str,
@@ -80,25 +121,24 @@ def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base
     ].copy()
 
     if df_missing.empty:
-        print("   ⚠️ No llegaron velas faltantes (esto puede ser normal).")
+        print(f"   ⚠️ {symbol}: no se recibieron velas faltantes.")
         return
 
-    # Reconvertir formato EXACTO para Google Sheets
+    # Reconstrucción EXACTA para Google Sheets
     df_missing["Open time"] = df_missing["Open time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
 
     df_missing["Close time"] = (
-        df_missing["Close time UTC"]
-            .dt.tz_convert("America/Costa_Rica")
-            - pd.Timedelta(milliseconds=1)
+        df_missing["Close time UTC"].dt.tz_convert("America/Costa_Rica")
+        - pd.Timedelta(milliseconds=1)
     ).dt.strftime("%Y-%m-%d %H:%M:%S.%f%z")
 
-    df_missing = df_missing[[
-        "Open time","Open","High","Low","Close","Volume","Close time"
-    ]]
+    df_missing = df_missing[
+        ["Open time", "Open", "High", "Low", "Close", "Volume", "Close time"]
+    ]
 
-    print(f"   ➕ Agregando {len(df_missing)} velas faltantes reales...")
-    append_rows(ws, df_missing)
+    print(f"   ➕ {symbol}: agregando {len(df_missing)} velas faltantes...")
 
+    append_rows(ws, df_missing, max_keep=max_keep)
 
 
 # =====================================================
@@ -117,6 +157,7 @@ def main():
         df_sheet = load_symbol_df(symbol)
 
         last_close_local = pd.to_datetime(df_sheet["Close time"].max())
+
         if pd.isna(last_close_local):
             last_close_local = pd.Timestamp("2000-01-01 00:00:00", tz=CR)
 
@@ -130,9 +171,7 @@ def main():
         except:
             raise RuntimeError(f"❌ La hoja {symbol} no existe.")
 
-        # ============================
-        # OBTENER LA ÚLTIMA VELA REAL
-        # ============================
+        # Obtener la última vela real
         preferred_base = None
         for base in bases_para(symbol):
             try:
@@ -150,20 +189,16 @@ def main():
         k_open_utc  = pd.to_datetime(open_ms,  unit="ms", utc=True)
         k_close_utc = pd.to_datetime(close_ms, unit="ms", utc=True)
 
-        # ============================
-        # 1) FIX GAPS ANTES DE NADA
-        # ============================
-        fix_gaps(symbol, df_sheet, last_close_utc, k_open_utc, ws, preferred_base)
+        # 1) FIX GAPS
+        fix_gaps(symbol, df_sheet, last_close_utc, k_open_utc, ws, preferred_base, max_keep=MAX_KEEP)
 
-        # ============================
-        # 2) AGREGAR LA VELA NUEVA
-        # ============================
+        # 2) Agregar vela nueva
         if k_close_utc <= last_close_utc:
             print(f"   ✓ No hay vela nueva por agregar.")
             continue
 
         open_local  = k_open_utc.tz_convert(CR)
-        close_local = (k_close_utc.tz_convert(CR) - pd.Timedelta(milliseconds=1))
+        close_local = k_close_utc.tz_convert(CR) - pd.Timedelta(milliseconds=1)
 
         row = {
             "Open time":  open_local.isoformat(" "),
@@ -175,7 +210,7 @@ def main():
             "Close time": close_local.isoformat(" ")
         }
 
-        append_rows(ws, pd.DataFrame([row]))
+        append_rows(ws, pd.DataFrame([row]), max_keep=MAX_KEEP)
 
         print(f"   ✓ Vela agregada: {row['Open time']} → {row['Close time']}")
 
