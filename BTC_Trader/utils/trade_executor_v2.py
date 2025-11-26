@@ -1,25 +1,29 @@
 # =============================================================
-# 🟢 Binance Spot Autotrader con OCO — Victor + GPT (versión limpia)
+# 🟢 Binance Spot Autotrader — Victor + GPT (versión estable sin OCO)
 # -------------------------------------------------------------
 # Objetivo:
-# - Ejecutar compras Market por porcentaje del equity total (wallet Spot)
-# - Colocar automáticamente una orden OCO (Take Profit + Stop Loss)
-# - Cancelar OCO activa y vender Market al recibir señal SELL
-# - Respeta pesos por símbolo (BTC, ETH, ADA, XRP, BNB)
-#
-# Seguridad:
-# - Si no hay claves configuradas, entra en modo “solo alertas”
-# - DRY_RUN permite simular sin enviar órdenes reales
+# - BUY → Market buy usando quoteOrderQty (USDT)
+# - SELL → Market sell del total del asset disponible
+# - Respeta los pesos por símbolo
+# - Log en /app/data/trade_log.csv
 # =============================================================
 
 import os
 import math
-import time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 
-# Intentamos importar el cliente solo si hay claves
+# Crear carpeta de logs
+os.makedirs("/app/data", exist_ok=True)
+
+# Archivo de logs fijo
+LOG_FILE = "/app/data/trade_log.csv"
+
+# DRY RUN (tiene que estar definido ANTES de usarlo en inicialización)
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+# Intentamos importar Binance
 try:
     from binance.client import Client
     from binance.enums import *
@@ -33,41 +37,7 @@ except ImportError:
 API_KEY    = os.getenv("BINANCE_API_KEY_TRADING") or os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET_TRADING") or os.getenv("BINANCE_API_SECRET")
 
-# ==========================================================
-# 🔒 Inicialización segura del cliente Binance
-# ==========================================================
-BINANCE_ENABLED = False
-client = None
-
-if not API_KEY or not API_SECRET or Client is None:
-    print("⚠️ Claves Binance no configuradas o módulo no disponible. Modo solo alertas activo.")
-else:
-    try:
-        client = Client(API_KEY, API_SECRET)
-        client.ping()  # 🔍 prueba de conexión rápida
-        BINANCE_ENABLED = True
-        print("✅ Cliente Binance inicializado correctamente.")
-    except Exception as e:
-        err = f"⚠️ Error al conectar con Binance: {e}"
-        print(err)
-        # --- registrar el error en el log, pero continuar la ejecución ---
-        try:
-            pd.DataFrame([{
-                "timestamp": datetime.utcnow().isoformat(),
-                "symbol": "SYSTEM",
-                "action": "BINANCE_INIT_ERROR",
-                "message": str(e),
-                "dry_run": os.getenv("DRY_RUN", "false").lower() == "true"
-            }]).to_csv("/data/trade_log.csv", mode="a", header=not os.path.exists("/data/trade_log.csv"), index=False)
-        except Exception as log_err:
-            print(f"⚠️ No se pudo registrar el error de Binance: {log_err}")
-        print("→ Continuando en modo solo alertas (sin ejecución real).")
-
-
-# Si quieres probar en modo simulado sin enviar órdenes reales
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-
-# Pesos por símbolo (suman 100%)
+# ===== Pesos por moneda (suman 1.0) =====
 PORTFOLIO_WEIGHTS = {
     "BTCUSDT": 0.35,
     "ETHUSDT": 0.25,
@@ -76,32 +46,68 @@ PORTFOLIO_WEIGHTS = {
     "BNBUSDT": 0.10,
 }
 
-# Archivo de logs
-LOG_FILE = os.getenv("TRADE_LOG_PATH", "./trade_log.csv")
-
-# Parámetros por defecto
 DEFAULT_RISK_PCT = 0.01
-DEFAULT_RR       = 1.5
-SL_TRIGGER_GAP   = 0.05
+DEFAULT_RR = 1.5
+SL_TRIGGER_GAP = 0.05
 
 # =============================
-# 1) Utilitarios
+# 🔒 1) Inicialización segura del cliente Binance
 # =============================
+
+BINANCE_ENABLED = False
+client = None
+
+if not API_KEY or not API_SECRET or Client is None:
+    print("⚠️ No hay claves Binance. Modo solo alertas.")
+else:
+    try:
+        client = Client(API_KEY, API_SECRET)
+        client.ping()
+        BINANCE_ENABLED = True
+        print("✅ Cliente Binance inicializado correctamente.")
+
+    except Exception as e:
+        print(f"⚠️ Error al iniciar Binance: {e}")
+
+        # Log robusto
+        try:
+            pd.DataFrame([{
+                "timestamp": datetime.utcnow().isoformat(),
+                "symbol": "SYSTEM",
+                "action": "BINANCE_INIT_ERROR",
+                "message": str(e),
+                "dry_run": DRY_RUN
+            }]).to_csv(LOG_FILE, mode="a",
+                       header=not os.path.exists(LOG_FILE),
+                       index=False)
+        except Exception as log_err:
+            print(f"⚠️ Error al guardar log inicial: {log_err}")
+
+        print("→ Continuando en modo solo alertas.")
+
+# =============================
+# 2) Utilitarios
+# =============================
+
+def _append_log(row: dict):
+    df = pd.DataFrame([row])
+    df.to_csv(LOG_FILE, mode="a",
+              header=not os.path.exists(LOG_FILE),
+              index=False)
+    print(f"🧾 LOG → {row.get('action')} {row.get('symbol')} (DRY_RUN={DRY_RUN})")
+
 
 def _round_step_size(value: float, step_size: float) -> float:
-    """Redondea el valor al múltiplo más cercano permitido por LOT_SIZE o PRICE_FILTER."""
     if step_size == 0:
         return value
 
     precision = int(round(-math.log(step_size, 10), 0)) if step_size < 1 else 0
 
-    dec_value = Decimal(str(value))
-    dec_step  = Decimal(str(step_size))
+    dec_val  = Decimal(str(value))
+    dec_step = Decimal(str(step_size))
 
-    # Redondeo al múltiplo permitido
-    rounded = (dec_value // dec_step) * dec_step
+    rounded = (dec_val // dec_step) * dec_step
 
-    # Aplicar quantize con precisión correcta
     if precision > 0:
         rounded = rounded.quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN)
     else:
@@ -110,15 +116,18 @@ def _round_step_size(value: float, step_size: float) -> float:
     return float(rounded)
 
 
-
 def _get_symbol_filters(symbol: str):
+    """Obtiene filters: LOT_SIZE, MIN_NOTIONAL, PRICE_FILTER."""
     if not BINANCE_ENABLED:
-        return {"step_size": 0.000001, "min_qty": 0.000001, "tick_size": 0.01, "min_notional": 10.0}
+        return {"step_size": 0.000001, "min_qty": 0.0, "tick_size": 0.01, "min_notional": 10.0}
+
     info = client.get_symbol_info(symbol)
     filters = {f["filterType"]: f for f in info["filters"]}
+
     lot = filters.get("LOT_SIZE", {})
     min_notional = filters.get("MIN_NOTIONAL", {})
     price_filter = filters.get("PRICE_FILTER", {})
+
     return {
         "step_size": float(lot.get("stepSize", 0)),
         "min_qty": float(lot.get("minQty", 0)),
@@ -127,104 +136,69 @@ def _get_symbol_filters(symbol: str):
     }
 
 
-def _get_price(symbol: str) -> float:
-    if not BINANCE_ENABLED:
-        return 0.0
-    ticker = client.get_symbol_ticker(symbol=symbol)
-    return float(ticker["price"]) if ticker and "price" in ticker else None
-
-
-def _get_spot_equity_usdt() -> float:
-    """Devuelve el equity total estimado en USDT."""
-    if not BINANCE_ENABLED:
-        return 1000.0  # simulación base
-    account = client.get_account()
-    balances = {b["asset"]: {"free": float(b["free"]), "locked": float(b["locked"])} for b in account.get("balances", [])}
-    total = balances.get("USDT", {"free": 0, "locked": 0})
-    total_usdt = total["free"] + total["locked"]
-    for asset, bal in balances.items():
-        if asset in ("USDT", "BUSD", "FDUSD"):
-            continue
-        qty = bal["free"] + bal["locked"]
-        if qty > 0:
-            symbol = f"{asset}USDT"
-            try:
-                price = _get_price(symbol)
-                total_usdt += qty * price
-            except Exception:
-                pass
-    return total_usdt
-
-
 def _get_free_balance(asset: str) -> float:
     if not BINANCE_ENABLED:
         return 1000.0 if asset == "USDT" else 0.0
+
     for b in client.get_account()["balances"]:
         if b["asset"] == asset:
             return float(b["free"])
     return 0.0
 
 
-def _append_log(row: dict):
-    """Agrega una línea al trade_log.csv."""
-    df = pd.DataFrame([row])
-    header = not os.path.exists(LOG_FILE)
-    df.to_csv(LOG_FILE, mode="a", header=header, index=False)
-    print(f"🧾 Log registrado: {row.get('action')} {row.get('symbol')} ({'DRY_RUN' if row.get('dry_run') else 'LIVE'})")
+def _get_price(symbol: str) -> float:
+    if not BINANCE_ENABLED:
+        return 0.0
+    t = client.get_symbol_ticker(symbol=symbol)
+    return float(t["price"])
 
-# =============================
-# 2) Cálculo TP/SL
-# =============================
 
-def compute_tp_sl(entry_price, rr=None, risk_pct=None, side="BUY", sl_trigger_gap=SL_TRIGGER_GAP):
-    rr = rr or DEFAULT_RR
-    risk_pct = risk_pct or DEFAULT_RISK_PCT
-    if side == "BUY":
-        sl_limit = entry_price * (1 - risk_pct)
-        tp_price = entry_price * (1 + rr * risk_pct)
-        sl_trigger = sl_limit * (1 + sl_trigger_gap)
-    else:
-        sl_limit = entry_price * (1 + risk_pct)
-        tp_price = entry_price * (1 - rr * risk_pct)
-        sl_trigger = sl_limit * (1 - sl_trigger_gap)
-    return tp_price, sl_limit, sl_trigger
+def _get_spot_equity_usdt() -> float:
+    """USDT total = balance USDT + valor de todas las criptos en USDT."""
+    if not BINANCE_ENABLED:
+        return 1000.0
+
+    acc = client.get_account()
+    balances = {b["asset"]: float(b["free"]) + float(b["locked"])
+                for b in acc["balances"]}
+
+    total = balances.get("USDT", 0.0)
+
+    for asset, qty in balances.items():
+        if asset in ("USDT", "BUSD", "FDUSD"):
+            continue
+        if qty <= 0:
+            continue
+        symbol = f"{asset}USDT"
+        try:
+            price = _get_price(symbol)
+            total += qty * price
+        except:
+            pass
+
+    return total
 
 # =============================
 # 3) Órdenes
 # =============================
 
 def place_market_buy_by_quote(symbol, usdt_amount):
-    """
-    Ejecuta una orden MARKET BUY usando quoteOrderQty (USDT).
-    Redondea correctamente según el tick_size para evitar el error -1111.
-    """
+    """Market BUY usando quoteOrderQty, redondeado a tick_size."""
     if not BINANCE_ENABLED:
-        return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+        return {"status": "SKIPPED", "dry_run": DRY_RUN}
 
-    # === Obtener tick_size del símbolo ===
     filters = _get_symbol_filters(symbol)
-    tick = filters["tick_size"]   # Ej: ETH/USDT → 0.01
+    tick = Decimal(str(filters["tick_size"]))
+    amt  = Decimal(str(usdt_amount))
 
-    # === Convertir a Decimal para evitar errores de float ===
-    tick_dec = Decimal(str(tick))
-    amt_dec = Decimal(str(usdt_amount))
+    # Redondeo seguro → evita error -1111
+    usdt_clean = float((amt // tick) * tick)
 
-    # === Redondear hacia abajo al múltiplo permitido ===
-    usdt_clean = (amt_dec // tick_dec) * tick_dec
-    usdt_clean = float(usdt_clean)
-
-    # === Simulación si estamos en DRY RUN ===
     if DRY_RUN:
         price = _get_price(symbol)
-        qty = usdt_clean / price if price else 0
-        return {
-            "symbol": symbol,
-            "status": "FILLED",
-            "executedQty": str(qty),
-            "price": str(price)
-        }
+        qty = usdt_clean / price
+        return {"symbol": symbol, "status": "FILLED", "executedQty": qty, "price": price}
 
-    # === Envío de orden REAL ===
     return client.create_order(
         symbol=symbol,
         side=SIDE_BUY,
@@ -233,220 +207,117 @@ def place_market_buy_by_quote(symbol, usdt_amount):
     )
 
 
-
-
-def place_oco_sell(symbol, quantity, tp_price, sl_limit_price, sl_trigger_price):
-    if not BINANCE_ENABLED:
-        return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
-    filters = _get_symbol_filters(symbol)
-    q = _round_step_size(quantity, filters["step_size"])
-    tp = _round_step_size(tp_price, filters["tick_size"])
-    sl = _round_step_size(sl_limit_price, filters["tick_size"])
-    tr = _round_step_size(sl_trigger_price, filters["tick_size"])
-    if DRY_RUN:
-        return {"symbol": symbol, "status": "SIMULATED_OCO", "qty": q, "tp": tp, "sl": sl, "tr": tr}
-    return client.create_oco_order(symbol=symbol, side=SIDE_SELL, quantity=str(q),
-                                   price=str(tp), stopPrice=str(tr), stopLimitPrice=str(sl),
-                                   stopLimitTimeInForce=TIME_IN_FORCE_GTC)
-
-
-def cancel_open_oco(symbol):
-    if not BINANCE_ENABLED:
-        return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
-    open_ocos = client.get_open_oco_orders()
-    cancelled = []
-    for oco in open_ocos:
-        if oco["orders"][0]["symbol"] == symbol:
-            res = client.cancel_oco_order(symbol=symbol, orderListId=oco["orderListId"])
-            cancelled.append(res)
-    return cancelled
-
-
 def sell_all_market(symbol):
+    """Vender TODO el balance de un asset."""
     if not BINANCE_ENABLED:
-        return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+        return {"status": "SKIPPED", "dry_run": DRY_RUN}
+
     asset = symbol.replace("USDT", "")
     qty = _get_free_balance(asset)
     if qty <= 0:
-        return {"status": "NO_POSITION", "symbol": symbol}
+        return {"status": "NO_POSITION"}
+
     filters = _get_symbol_filters(symbol)
     q = _round_step_size(qty, filters["step_size"])
+
     if DRY_RUN:
-        return {"symbol": symbol, "side": "SELL", "qty": q, "status": "SIMULATED"}
-    return client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=str(q))
+        return {"symbol": symbol, "status": "SIMULATED", "qty": q}
+
+    return client.create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        type=ORDER_TYPE_MARKET,
+        quantity=str(q)
+    )
 
 # =============================
-# 4) Señales
+# 4) Señales BUY / SELL
 # =============================
 
-def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pct=None):
-    """
-    Ejecuta una compra Market usando el porcentaje del equity según PORTFOLIO_WEIGHTS.
-    ⚠️ Versión segura SIN OCO (solo market buy).
-    """
+def handle_buy_signal(symbol):
+    """BUY sin OCO."""
     try:
         if not BINANCE_ENABLED:
-            msg = f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas."
-            print(msg)
-            _append_log({
-                "timestamp": datetime.utcnow(),
-                "symbol": symbol,
-                "action": "SKIPPED_NO_KEYS",
-                "message": msg,
-                "dry_run": DRY_RUN
-            })
-            return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+            print(f"⚠️ BUY SKIPPED {symbol} (no keys)")
+            return
 
-        # ===== 1) Cálculo de monto a invertir =====
         equity = _get_spot_equity_usdt()
         free_usdt = _get_free_balance("USDT")
         weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
+
         usdt_to_spend = min(equity * weight, free_usdt)
 
-        price = _get_price(symbol)
-        if not price:
-            raise ValueError("No se pudo obtener el precio del símbolo")
-
         filters = _get_symbol_filters(symbol)
-        min_notional = filters["min_notional"]
+        if usdt_to_spend < filters["min_notional"]:
+            return {"status": "INSUFFICIENT_USDT"}
 
-        if usdt_to_spend < max(min_notional, 10.0):
-            msg = f"❌ USDT insuficiente ({usdt_to_spend:.2f} < {min_notional:.2f})"
-            print(msg)
-            _append_log({
-                "timestamp": datetime.utcnow(),
-                "symbol": symbol,
-                "action": "INSUFFICIENT_USDT",
-                "equity_total": equity,
-                "free_usdt": free_usdt,
-                "usdt_spent": usdt_to_spend,
-                "message": msg,
-                "dry_run": DRY_RUN
-            })
-            return {"status": "INSUFFICIENT_USDT", "symbol": symbol}
+        print(f"🟢 BUY {symbol} por {usdt_to_spend:.2f} USDT…")
+        order = place_market_buy_by_quote(symbol, usdt_to_spend)
 
-        # ===== 2) Market BUY =====
-        print(f"🟢 Ejecutando BUY {symbol} por {usdt_to_spend:.2f} USDT (equity={equity:.2f}, balance={free_usdt:.2f})")
-        buy_order = place_market_buy_by_quote(symbol, usdt_to_spend)
-
-        entry_price = float(buy_order.get("price", price))
-        qty = float(buy_order.get("executedQty", usdt_to_spend / price))
-
-        # ===== 3) NO OCO POR AHORA =====
-        print(f"🎯 OCO desactivado temporalmente. SOLO BUY ejecutado para {symbol}.")
-        oco = {"status": "OCO_DISABLED"}
-
-        # ===== 4) Log =====
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
-            "action": "BUY_ONLY",
-            "equity_total": equity,
-            "free_usdt": free_usdt,
+            "action": "BUY",
             "usdt_spent": usdt_to_spend,
-            "entry_price": entry_price,
-            "qty": qty,
-            "dry_run": DRY_RUN,
-            "message": "Buy ejecutado (sin OCO)"
+            "entry_price": order.get("price"),
+            "qty": order.get("executedQty"),
+            "dry_run": DRY_RUN
         })
 
-        return {"buy": buy_order, "oco": oco}
+        return order
 
     except Exception as e:
-        err = f"⚠️ Error en BUY {symbol}: {e}"
-        print(err)
+        print(f"❌ Error BUY {symbol}: {e}")
         _append_log({
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
             "action": "ERROR_BUY",
             "message": str(e),
             "dry_run": DRY_RUN
         })
-        return {"status": "ERROR", "error": str(e)}
 
 
 def handle_sell_signal(symbol):
+    """SELL (market)."""
     try:
         if not BINANCE_ENABLED:
-            msg = f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas."
-            print(msg)
-            _append_log({
-                "timestamp": datetime.utcnow(),
-                "symbol": symbol,
-                "action": "SKIPPED_NO_KEYS",
-                "message": msg,
-                "dry_run": DRY_RUN
-            })
-            return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+            print(f"⚠️ SELL SKIPPED {symbol} (no keys)")
+            return
 
-        print(f"🔍 Buscando OCO activo para {symbol}...")
-        cancel_res = cancel_open_oco(symbol)
-        if cancel_res:
-            print(f"🟡 OCO encontrado y cancelado ({len(cancel_res)} órdenes).")
-        else:
-            print("⚠️ No se encontraron OCOs activos.")
-
-        asset = symbol.replace("USDT", "")
-        free_qty = _get_free_balance(asset)
-        equity = _get_spot_equity_usdt()
-
-        if free_qty <= 0:
-            msg = f"❌ No hay balance disponible para vender {asset}."
-            print(msg)
-            _append_log({
-                "timestamp": datetime.utcnow(),
-                "symbol": symbol,
-                "action": "NO_POSITION",
-                "equity_total": equity,
-                "free_qty": free_qty,
-                "message": msg,
-                "dry_run": DRY_RUN
-            })
-            return {"status": "NO_POSITION", "symbol": symbol}
-
-        print(f"🔴 Ejecutando Market SELL {symbol} — cantidad={free_qty:.6f}")
-        sell_res = sell_all_market(symbol)
+        print(f"🔴 SELL {symbol}…")
+        res = sell_all_market(symbol)
 
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
-            "action": "CANCEL_OCO+SELL",
-            "equity_total": equity,
-            "free_qty": free_qty,
-            "dry_run": DRY_RUN,
-            "message": "Cancelación y venta ejecutadas correctamente"
+            "action": "SELL",
+            "qty": res.get("origQty") if isinstance(res, dict) else None,
+            "dry_run": DRY_RUN
         })
-        print(f"✅ SELL completado para {symbol}. (DRY_RUN={DRY_RUN})")
 
-        return {"cancel": cancel_res, "sell": sell_res}
+        return res
 
     except Exception as e:
-        err = f"⚠️ Error en SELL {symbol}: {e}"
-        print(err)
+        print(f"❌ Error SELL {symbol}: {e}")
         _append_log({
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
             "action": "ERROR_SELL",
             "message": str(e),
             "dry_run": DRY_RUN
         })
-        return {"status": "ERROR", "error": str(e)}
 
 # =============================
 # 5) Enrutador
 # =============================
 
 def route_signal(signal: dict):
-    """Enruta la señal BUY/SELL a la función correspondiente."""
-    symbol = signal.get("symbol")
     side = signal.get("side", "").upper()
+    symbol = signal.get("symbol")
+
     if side == "BUY":
-        return handle_buy_signal(symbol,
-                                 rr=signal.get("rr"),
-                                 risk_pct=signal.get("risk_pct"),
-                                 tp_price=signal.get("tp_price"),
-                                 sl_limit_pct=signal.get("sl_limit_pct"))
+        return handle_buy_signal(symbol)
     elif side == "SELL":
         return handle_sell_signal(symbol)
     else:
-        return {"status": "IGNORED", "reason": "side no soportado", "side": side}
+        return {"status": "IGNORED", "detail": "side no soportado"}
