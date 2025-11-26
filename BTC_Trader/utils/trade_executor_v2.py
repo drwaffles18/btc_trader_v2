@@ -8,138 +8,138 @@
 # - Log en /app/data/trade_log.csv
 # =============================================================
 
+# =============================================================
+# 🟢 Binance Spot Autotrader — Victor + GPT (versión estable sin OCO)
+# -------------------------------------------------------------
+# Log interno en CSV + Log de trades en Google Sheets
+# =============================================================
+
 import os
 import math
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 
+from utils.google_client import get_gsheet_client
+
 # Crear carpeta de logs
 os.makedirs("/app/data", exist_ok=True)
 
-# Archivo de logs fijo
 LOG_FILE = "/app/data/trade_log.csv"
 
-# DRY RUN (tiene que estar definido ANTES de usarlo en inicialización)
+# DRY RUN
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# Intentamos importar Binance
+# =============================
+# 0) Binance client
+# =============================
 try:
     from binance.client import Client
     from binance.enums import *
 except ImportError:
     Client = None
 
-# =============================
-# 0) Configuración general
-# =============================
-
 API_KEY    = os.getenv("BINANCE_API_KEY_TRADING") or os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET_TRADING") or os.getenv("BINANCE_API_SECRET")
-
-# ===== Pesos por moneda (suman 1.0) =====
-PORTFOLIO_WEIGHTS = {
-    "BTCUSDT": 0.35,
-    "ETHUSDT": 0.25,
-    "ADAUSDT": 0.10,
-    "XRPUSDT": 0.20,
-    "BNBUSDT": 0.10,
-}
-
-DEFAULT_RISK_PCT = 0.01
-DEFAULT_RR = 1.5
-SL_TRIGGER_GAP = 0.05
-
-# =============================
-# 🔒 1) Inicialización segura del cliente Binance
-# =============================
 
 BINANCE_ENABLED = False
 client = None
 
-if not API_KEY or not API_SECRET or Client is None:
-    print("⚠️ No hay claves Binance. Modo solo alertas.")
-else:
+if API_KEY and API_SECRET and Client:
     try:
         client = Client(API_KEY, API_SECRET)
         client.ping()
         BINANCE_ENABLED = True
-        print("✅ Cliente Binance inicializado correctamente.")
-
+        print("✅ Cliente Binance inicializado.")
     except Exception as e:
-        print(f"⚠️ Error al iniciar Binance: {e}")
+        print(f"⚠️ Error Binance: {e}")
+else:
+    print("⚠️ Binance desactivado. Modo solo alertas.")
 
-        # Log robusto
-        try:
-            pd.DataFrame([{
-                "timestamp": datetime.utcnow().isoformat(),
-                "symbol": "SYSTEM",
-                "action": "BINANCE_INIT_ERROR",
-                "message": str(e),
-                "dry_run": DRY_RUN
-            }]).to_csv(LOG_FILE, mode="a",
-                       header=not os.path.exists(LOG_FILE),
-                       index=False)
-        except Exception as log_err:
-            print(f"⚠️ Error al guardar log inicial: {log_err}")
-
-        print("→ Continuando en modo solo alertas.")
 
 # =============================
-# 2) Utilitarios
+# 1) GOOGLE SHEETS — pestaña Trades
 # =============================
+GSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+client_sheets = get_gsheet_client()
+sheet_trades = client_sheets.open_by_key(GSHEET_ID).worksheet("Trades")
+
+
+# =============================================================
+# UTILITARIOS
+# =============================================================
 
 def _append_log(row: dict):
+    """Escribe en /app/data/trade_log.csv."""
     df = pd.DataFrame([row])
-    df.to_csv(LOG_FILE, mode="a",
-              header=not os.path.exists(LOG_FILE),
-              index=False)
+    df.to_csv(LOG_FILE, mode="a", header=not os.path.exists(LOG_FILE), index=False)
     print(f"🧾 LOG → {row.get('action')} {row.get('symbol')} (DRY_RUN={DRY_RUN})")
+
+
+def append_trade_row(ws, row_dict):
+    """
+    Inserta fila completa en pestaña Trades de Google Sheets.
+    Columnas estándar:
+    A: trade_id
+    B: symbol
+    C: side
+    D: qty
+    E: entry_price
+    F: entry_time
+    G: exit_price
+    H: exit_time
+    I: profit_usdt
+    J: status
+    """
+    columns = [
+        "trade_id",
+        "symbol",
+        "side",
+        "qty",
+        "entry_price",
+        "entry_time",
+        "exit_price",
+        "exit_time",
+        "profit_usdt",
+        "status"
+    ]
+
+    values = [[row_dict.get(col, "") for col in columns]]
+
+    next_row = len(ws.col_values(1)) + 1
+    ws.update(f"A{next_row}:J{next_row}", values)
 
 
 def _round_step_size(value: float, step_size: float) -> float:
     if step_size == 0:
         return value
-
     precision = int(round(-math.log(step_size, 10), 0)) if step_size < 1 else 0
-
     dec_val  = Decimal(str(value))
     dec_step = Decimal(str(step_size))
-
     rounded = (dec_val // dec_step) * dec_step
-
     if precision > 0:
         rounded = rounded.quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN)
     else:
         rounded = rounded.quantize(Decimal("1"), rounding=ROUND_DOWN)
-
     return float(rounded)
 
 
 def _get_symbol_filters(symbol: str):
-    """Obtiene filters: LOT_SIZE, MIN_NOTIONAL, PRICE_FILTER."""
     if not BINANCE_ENABLED:
         return {"step_size": 0.000001, "min_qty": 0.0, "tick_size": 0.01, "min_notional": 10.0}
-
     info = client.get_symbol_info(symbol)
     filters = {f["filterType"]: f for f in info["filters"]}
-
-    lot = filters.get("LOT_SIZE", {})
-    min_notional = filters.get("MIN_NOTIONAL", {})
-    price_filter = filters.get("PRICE_FILTER", {})
-
     return {
-        "step_size": float(lot.get("stepSize", 0)),
-        "min_qty": float(lot.get("minQty", 0)),
-        "tick_size": float(price_filter.get("tickSize", 0)),
-        "min_notional": float(min_notional.get("minNotional", 0)),
+        "step_size": float(filters["LOT_SIZE"]["stepSize"]),
+        "min_qty": float(filters["LOT_SIZE"]["minQty"]),
+        "tick_size": float(filters["PRICE_FILTER"]["tickSize"]),
+        "min_notional": float(filters["MIN_NOTIONAL"]["minNotional"]),
     }
 
 
 def _get_free_balance(asset: str) -> float:
     if not BINANCE_ENABLED:
         return 1000.0 if asset == "USDT" else 0.0
-
     for b in client.get_account()["balances"]:
         if b["asset"] == asset:
             return float(b["free"])
@@ -154,44 +154,48 @@ def _get_price(symbol: str) -> float:
 
 
 def _get_spot_equity_usdt() -> float:
-    """USDT total = balance USDT + valor de todas las criptos en USDT."""
+    """Equity = USDT + valoración de todas las criptos."""
     if not BINANCE_ENABLED:
         return 1000.0
 
     acc = client.get_account()
-    balances = {b["asset"]: float(b["free"]) + float(b["locked"])
-                for b in acc["balances"]}
-
+    balances = {b["asset"]: float(b["free"]) + float(b["locked"]) for b in acc["balances"]}
     total = balances.get("USDT", 0.0)
 
     for asset, qty in balances.items():
         if asset in ("USDT", "BUSD", "FDUSD"):
             continue
-        if qty <= 0:
-            continue
-        symbol = f"{asset}USDT"
-        try:
-            price = _get_price(symbol)
-            total += qty * price
-        except:
-            pass
+        if qty > 0:
+            symbol = f"{asset}USDT"
+            try:
+                price = _get_price(symbol)
+                total += qty * price
+            except:
+                pass
 
     return total
 
-# =============================
-# 3) Órdenes
-# =============================
+
+# =============================================================
+# ÓRDENES
+# =============================================================
+
+PORTFOLIO_WEIGHTS = {
+    "BTCUSDT": 0.35,
+    "ETHUSDT": 0.25,
+    "ADAUSDT": 0.10,
+    "XRPUSDT": 0.20,
+    "BNBUSDT": 0.10,
+}
 
 def place_market_buy_by_quote(symbol, usdt_amount):
-    """Market BUY usando quoteOrderQty, redondeado a tick_size."""
+    """Market BUY usando quoteOrderQty."""
     if not BINANCE_ENABLED:
         return {"status": "SKIPPED", "dry_run": DRY_RUN}
 
     filters = _get_symbol_filters(symbol)
     tick = Decimal(str(filters["tick_size"]))
     amt  = Decimal(str(usdt_amount))
-
-    # Redondeo seguro → evita error -1111
     usdt_clean = float((amt // tick) * tick)
 
     if DRY_RUN:
@@ -208,7 +212,7 @@ def place_market_buy_by_quote(symbol, usdt_amount):
 
 
 def sell_all_market(symbol):
-    """Vender TODO el balance de un asset."""
+    """Market SELL del balance completo."""
     if not BINANCE_ENABLED:
         return {"status": "SKIPPED", "dry_run": DRY_RUN}
 
@@ -221,7 +225,8 @@ def sell_all_market(symbol):
     q = _round_step_size(qty, filters["step_size"])
 
     if DRY_RUN:
-        return {"symbol": symbol, "status": "SIMULATED", "qty": q}
+        price = _get_price(symbol)
+        return {"symbol": symbol, "status": "SIMULATED", "qty": q, "price": price}
 
     return client.create_order(
         symbol=symbol,
@@ -230,12 +235,13 @@ def sell_all_market(symbol):
         quantity=str(q)
     )
 
-# =============================
-# 4) Señales BUY / SELL
-# =============================
+
+# =============================================================
+# BUY
+# =============================================================
 
 def handle_buy_signal(symbol):
-    """BUY sin OCO."""
+    """BUY + registrar entrada en Google Sheets."""
     try:
         if not BINANCE_ENABLED:
             print(f"⚠️ BUY SKIPPED {symbol} (no keys)")
@@ -254,14 +260,34 @@ def handle_buy_signal(symbol):
         print(f"🟢 BUY {symbol} por {usdt_to_spend:.2f} USDT…")
         order = place_market_buy_by_quote(symbol, usdt_to_spend)
 
+        entry_price = float(order.get("price"))
+        qty = float(order.get("executedQty"))
+
+        # log interno
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
             "action": "BUY",
             "usdt_spent": usdt_to_spend,
-            "entry_price": order.get("price"),
-            "qty": order.get("executedQty"),
+            "entry_price": entry_price,
+            "qty": qty,
             "dry_run": DRY_RUN
+        })
+
+        # log google sheets
+        trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
+
+        append_trade_row(sheet_trades, {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "side": "BUY",
+            "qty": qty,
+            "entry_price": entry_price,
+            "entry_time": datetime.utcnow().isoformat(),
+            "exit_price": "",
+            "exit_time": "",
+            "profit_usdt": "",
+            "status": "OPEN"
         })
 
         return order
@@ -277,8 +303,12 @@ def handle_buy_signal(symbol):
         })
 
 
+# =============================================================
+# SELL
+# =============================================================
+
 def handle_sell_signal(symbol):
-    """SELL (market)."""
+    """SELL + cierre del trade en Google Sheets."""
     try:
         if not BINANCE_ENABLED:
             print(f"⚠️ SELL SKIPPED {symbol} (no keys)")
@@ -287,13 +317,37 @@ def handle_sell_signal(symbol):
         print(f"🔴 SELL {symbol}…")
         res = sell_all_market(symbol)
 
+        sell_price = float(res.get("price", 0))
+
+        # log interno
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
             "action": "SELL",
-            "qty": res.get("origQty") if isinstance(res, dict) else None,
+            "sell_price": sell_price,
             "dry_run": DRY_RUN
         })
+
+        # buscar trade OPEN
+        trades = sheet_trades.get_all_records()
+        open_trades = [t for t in trades if t["symbol"] == symbol and t["status"] == "OPEN"]
+
+        if not open_trades:
+            print("⚠️ No hay trades abiertos.")
+            return res
+
+        last_trade = open_trades[-1]
+        row_index = trades.index(last_trade) + 2  # +2 por header + base 1
+
+        qty = float(last_trade["qty"])
+        entry_price = float(last_trade["entry_price"])
+        profit = (sell_price - entry_price) * qty
+
+        # actualizar google sheets
+        sheet_trades.update(f"G{row_index}", str(sell_price))
+        sheet_trades.update(f"H{row_index}", datetime.utcnow().isoformat())
+        sheet_trades.update(f"I{row_index}", str(profit))
+        sheet_trades.update(f"J{row_index}", "CLOSED")
 
         return res
 
@@ -307,9 +361,10 @@ def handle_sell_signal(symbol):
             "dry_run": DRY_RUN
         })
 
-# =============================
-# 5) Enrutador
-# =============================
+
+# =============================================================
+# ROUTER
+# =============================================================
 
 def route_signal(signal: dict):
     side = signal.get("side", "").upper()
@@ -320,4 +375,5 @@ def route_signal(signal: dict):
     elif side == "SELL":
         return handle_sell_signal(symbol)
     else:
-        return {"status": "IGNORED", "detail": "side no soportado"}
+        return {"status": "IGNORED"}
+
