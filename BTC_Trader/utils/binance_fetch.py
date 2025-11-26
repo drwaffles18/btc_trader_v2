@@ -291,28 +291,20 @@ def fetch_last_closed_kline_5m(symbol: str, base_url: str, session=None):
 import time
 from datetime import datetime, timezone
 
-def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
+def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, preferred_base=None):
     """
-    Descarga TODO el histórico 5m entre start_dt y end_dt usando paginación automática.
-
-    Ejemplo:
-        df = get_binance_5m_data_between("BTCUSDT", "2024-12-01 00:00:00")
-
-    Parámetros:
-        symbol   : símbolo de Binance ej. "BTCUSDT"
-        start_dt : fecha inicial en formato "YYYY-MM-DD HH:MM:SS"
-        end_dt   : fecha final. Si es None → usa hora actual del servidor Binance
-
-    Retorna:
-        pandas.DataFrame con TODAS las velas entre start_dt y end_dt
+    Descarga TODO el histórico 5m entre start_dt y end_dt usando paginación automática,
+    respetando la base preferida (para evitar velas planas/inventadas).
     """
 
-    # 1) Convertir fechas a milisegundos UTC
+    # === 1) Convertir fechas a ms UTC ===
     start_ms = int(pd.Timestamp(start_dt, tz="UTC").timestamp() * 1000)
 
-    # 2) Si no se da end_dt, pedir hora de servidor Binance
+    # === 2) Determinar end_ms (si no se da) ===
     if end_dt is None:
-        r = _session.get(f"{US_HOST}/api/v3/time", timeout=5, headers=_HEADERS)
+        # IMPORTANTE: usar la base preferida para sincronizar con el servidor correcto
+        base_for_time = preferred_base or US_HOST
+        r = _session.get(f"{base_for_time}/api/v3/time", timeout=5, headers=_HEADERS)
         r.raise_for_status()
         server_time = r.json()["serverTime"]
         end_ms = int(server_time)
@@ -320,22 +312,28 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
         end_ms = int(pd.Timestamp(end_dt, tz="UTC").timestamp() * 1000)
 
     print(f"[binance_fetch] HISTÓRICO {symbol} 5m → desde {start_dt} hasta {pd.to_datetime(end_ms, unit='ms')}")
-    print(f"[binance_fetch] bases: {_bases_for(symbol)}")
 
+    # === 3) Orden de bases ===
+    bases = _bases_for(symbol)
+    if preferred_base and preferred_base in bases:
+        bases = [preferred_base] + [b for b in bases if b != preferred_base]
+
+    print(f"[binance_fetch] bases: {bases}")
+
+    # === 4) Preparación ===
     frames = []
     fetch_size = 1000
     current_start = start_ms
 
-    bases = _bases_for(symbol)
-
+    # === 5) Ciclo de paginación ===
     while current_start < end_ms:
 
         current_end = min(current_start + fetch_size * FIVE_MIN_MS, end_ms)
 
-        # Intento de fetch con fallback bases
         last_exc = None
         data = None
 
+        # === PROBAR CADA BASE ===
         for base in bases:
             try:
                 url = f"{base}/api/v3/klines"
@@ -344,12 +342,12 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
                     "interval": "5m",
                     "startTime": current_start,
                     "endTime": current_end - 1,
-                    "limit": 1000
+                    "limit": 1000,
                 }
 
                 resp = _session.get(url, params=params, timeout=10, headers=_HEADERS)
 
-                # Saltar bloqueos
+                # saltar bloqueos
                 if resp.status_code in (451, 403):
                     raise requests.HTTPError(f"{resp.status_code} from {base}", response=resp)
 
@@ -357,8 +355,8 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
                 data = resp.json()
 
                 if isinstance(data, list):
-                    _PREFERRED_BASE[symbol] = base
-                    break  # éxito
+                    _PREFERRED_BASE[symbol] = base  # memorizar
+                    break
 
                 raise ValueError(f"Formato inesperado: {data}")
 
@@ -371,10 +369,9 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
             raise last_exc
 
         if len(data) == 0:
-            # No más velas en este rango → terminar
-            break
+            break  # no más velas en el rango
 
-        # Convertir a DataFrame
+        # === Convertir respuesta ===
         cols = [
             "Open time","Open","High","Low","Close","Volume",
             "Close time","Quote asset volume","Number of trades",
@@ -382,35 +379,35 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None):
         ]
         df = pd.DataFrame(data, columns=cols)
 
-        # 1) Numéricos
+        # numéricos
         for c in ["Open","High","Low","Close","Volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # 2) Tiempos UTC
-        df["Open time UTC"]  = pd.to_datetime(df["Open time"], unit="ms", utc=True)
+        # tiempos
+        df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
         df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
 
-        # 3) Tiempos CR
+        # CR visual
         df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
         df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
 
         frames.append(df)
 
-        # Avanzar puntero
+        # avance del puntero
         last_close_ms = int(df["Close time UTC"].iloc[-1].timestamp() * 1000)
         current_start = last_close_ms + FIVE_MIN_MS
 
-        # Pausa ligera para no golpear el API
-        time.sleep(0.1)
+        time.sleep(0.08)  # respetuoso con el API
 
     if not frames:
-        raise RuntimeError(f"No se obtuvo historial 5m para {symbol}")
+        raise RuntimeError(f"No se obtuvo histórico 5m para {symbol}")
 
     final_df = pd.concat(frames, ignore_index=True)
     final_df = final_df.sort_values("Open time UTC").reset_index(drop=True)
 
-    print(f"[binance_fetch] ✓ obtenido histórico completo: {len(final_df)} velas.")
+    print(f"[binance_fetch] ✓ obtenido histórico completo: {len(final_df)} velas (consistente).")
     return final_df
+
 
 
 
