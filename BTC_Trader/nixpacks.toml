@@ -1,0 +1,11 @@
+[phases.setup]
+apt_packages = ["python3", "python3-pip"]
+
+[phases.build]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install -r requirements.txt"
+]
+
+[phases.start]
+cmd = "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
