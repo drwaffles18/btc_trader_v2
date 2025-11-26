@@ -2,6 +2,8 @@
 import pandas as pd
 import pytz
 
+## esta funcion no se esta utiliando
+
 CR = pytz.timezone("America/Costa_Rica")
 
 
