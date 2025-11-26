@@ -30,3 +30,35 @@ def load_symbol_df(symbol: str):
     df = df.sort_values("Open time").reset_index(drop=True)
 
     return df
+
+def append_trade_row(ws, row_dict):
+    """
+    Agrega una fila al final de la hoja Trades.
+    row_dict = {
+        "trade_id": ...,
+        "symbol": ...,
+        "side": ...,
+        "qty": ...,
+        "entry_price": ...,
+        "entry_time": ...,
+        "exit_price": ...,
+        "exit_time": ...,
+        "profit_usdt": ...,
+        "status": ...
+    }
+    """
+    values = [[row_dict.get(c, "") for c in [
+        "trade_id",
+        "symbol",
+        "side",
+        "qty",
+        "entry_price",
+        "entry_time",
+        "exit_price",
+        "exit_time",
+        "profit_usdt",
+        "status"
+    ]]]
+
+    next_row = len(ws.col_values(1)) + 1
+    ws.update(range_name=f"A{next_row}:J{next_row}", values=values)
