@@ -90,15 +90,25 @@ def main():
         # ==========================================================
         # Construir fila EXACTA como el histórico completo
         # ==========================================================
+
         row = {
+            # Local time (SIN timezone) — igual que histórico completo
             "Open time": k_open_local.strftime("%Y-%m-%d %H:%M:%S"),
             "Open": float(kline[1]),
             "High": float(kline[2]),
             "Low": float(kline[3]),
             "Close": float(kline[4]),
             "Volume": float(kline[5]),
-            "Close time": k_close_local.strftime("%Y-%m-%d %H:%M:%S.%f")
+        
+            # Local close time con microsegundos — igual que histórico completo
+            "Close time": k_close_local.strftime("%Y-%m-%d %H:%M:%S.%f"),
+        
+            # UTC extra columns — igual que histórico completo
+            "Open time UTC": k_open_utc.strftime("%Y-%m-%d %H:%M:%S.%f%z"),
+            "Close time UTC": k_close_utc.strftime("%Y-%m-%d %H:%M:%S.%f%z"),
         }
+
+
 
         df_new = pd.DataFrame([row])
         append_row(ws, df_new)
