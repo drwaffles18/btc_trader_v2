@@ -10,6 +10,7 @@ sys.path.append(ROOT)
 from utils.google_client import get_gsheet_client
 from utils.load_from_sheets import load_symbol_df
 from utils.binance_fetch import fetch_last_closed_kline_5m, bases_para
+from repair_gaps import repair_gaps   # 👈 NUEVO
 
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
@@ -19,7 +20,6 @@ CR = pytz.timezone("America/Costa_Rica")   # zona horaria de tu histórico
 # =================================================
 # Helpers
 # =================================================
-
 
 def normalize_utc(ms):
     """Convierte timestamp en ms → UTC redondeado a 5m."""
@@ -51,13 +51,17 @@ def main():
 
         # último close en el sheet (local, pero lo convertimos a UTC para comparar)
         last_close_local = pd.to_datetime(df["Close time"].max())
-        
+
         # ==================================
         # Fix: manejar NaT (sheet vacío)
         # ==================================
         if pd.isna(last_close_local):
-            last_close_local = pd.Timestamp("2000-01-01 00:00:00")
-        
+            # Si el sheet está vacío, este incremental no debería intentar
+            # backfillear toda la historia. Para eso está el histórico total.
+            # Dejamos una fecha muy vieja para que, si por alguna razón se usa,
+            # no rompa comparaciones.
+            last_close_local = pd.Timestamp("2000-01-01 00:00:00", tz=CR)
+
         # =============================
         # Manejo robusto de timezone
         # =============================
@@ -67,9 +71,6 @@ def main():
         else:
             # ya tiene timezone → convertir directamente
             last_close_utc = last_close_local.tz_convert("UTC")
-
-
-
 
         try:
             ws = sh.worksheet(symbol)
@@ -85,7 +86,7 @@ def main():
                 print(f"   ✗ {base} falló: {e}")
                 continue
 
-        # timestamps de Binance → UTC
+        # timestamps de Binance → UTC (abertura y cierre)
         k_open_utc  = normalize_utc(open_ms)
         k_close_utc = normalize_utc(close_ms)
 
@@ -93,6 +94,23 @@ def main():
         if k_close_utc <= last_close_utc:
             print(f"   ✓ No hay velas nuevas (última = {last_close_utc}, incremental = {k_close_utc})")
             continue
+
+        # =====================================================
+        # GAPS: detectar si faltan candelas intermedias
+        # =====================================================
+        # Derivamos el open time de la última vela que ya tienes en el sheet
+        # a partir de su close (last_close_utc ~ XX:XX:59.999)
+        last_open_utc = (last_close_utc + pd.Timedelta(milliseconds=1)).floor("5min") - pd.Timedelta(minutes=5)
+
+        delta_sec = (k_open_utc - last_open_utc).total_seconds()
+        missing_candles = int(delta_sec // 300)  # 300 seg = 5 min
+
+        if missing_candles > 1:
+            print(f"   ⚠️ Se detectaron {missing_candles - 1} candelas faltantes para {symbol}.")
+            # Repara SOLO las intermedias (no incluye la vela de k_open_utc)
+            repair_gaps(symbol, ws, last_open_utc, k_open_utc)
+        else:
+            print(f"   ✓ {symbol}: sin gaps, solo se agregará la nueva vela.")
 
         # -----------------------------------------
         # Convertir UTC → hora local de Costa Rica
@@ -116,13 +134,12 @@ def main():
             "Close time": k_close_local.isoformat(" ")
         }
 
-
         df_new = pd.DataFrame([row])
         append_row(ws, df_new)
 
         print(f"   ✓ Vela agregada: {row['Open time']} → {row['Close time']}")
 
-    print("\n🎉 Incremental completado sin duplicados.")
+    print("\n🎉 Incremental completado sin duplicados ni gaps.")
 
 if __name__ == "__main__":
     main()
