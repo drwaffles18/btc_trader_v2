@@ -228,19 +228,22 @@ def sell_all_market(symbol):
 # -----------------------------
 
 def handle_buy_signal(symbol):
+    """BUY sin OCO + cálculo correcto del entry_price."""
     try:
         if not BINANCE_ENABLED:
             print(f"⚠️ BUY SKIPPED (no keys) {symbol}")
             return
 
+        # === 1. Cálculo de cuánto invertir ===
         equity = _get_spot_equity_usdt()
         free_usdt = _get_free_balance("USDT")
         weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
+
         usdt_to_spend = min(equity * weight, free_usdt)
 
         filters = _get_symbol_filters(symbol)
 
-        # 🔥 FIX: usar fallback a 5 USDT si no existe MIN_NOTIONAL
+        # 🔥 fallback si MIN_NOTIONAL está ausente (BTCUSDT por ejemplo)
         min_notional = filters["min_notional"] or BINANCE_NOTIONAL_FLOOR
         min_required = max(min_notional, BINANCE_NOTIONAL_FLOOR)
 
@@ -249,14 +252,27 @@ def handle_buy_signal(symbol):
             return {"status": "INSUFFICIENT_USDT"}
 
         print(f"🟢 BUY {symbol} por {usdt_to_spend:.2f} USDT")
+
+        # === 2. Ejecutar Market BUY ===
         order = place_market_buy_by_quote(symbol, usdt_to_spend)
 
-        entry_price = float(order.get("price"))
-        qty = float(order.get("executedQty"))
+        # === 3. Extraer precio REAL del BUY ===
+        executed_qty = float(order.get("executedQty", 0))
+        quote_spent = float(order.get("cummulativeQuoteQty", usdt_to_spend))
 
-        # === Registrar en CSV
+        # En MARKET BUY, Binance siempre retorna price = 0 → usamos el promedio real
+        if executed_qty > 0:
+            entry_price = quote_spent / executed_qty
+        else:
+            # fallback ultra seguro
+            entry_price = _get_price(symbol)
+
+        qty = executed_qty
+
+        # === 4. Registrar ID ===
         trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
 
+        # === 5. Log CSV ===
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
@@ -267,7 +283,7 @@ def handle_buy_signal(symbol):
             "dry_run": DRY_RUN
         })
 
-        # === Registrar en Google Sheets
+        # === 6. Insertar en Google Sheets ===
         append_trade_row(ws_trades, {
             "trade_id": trade_id,
             "symbol": symbol,
@@ -292,6 +308,7 @@ def handle_buy_signal(symbol):
             "message": str(e),
             "dry_run": DRY_RUN
         })
+
 
 
 # -----------------------------
