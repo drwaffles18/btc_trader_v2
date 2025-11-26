@@ -51,7 +51,18 @@ def main():
 
         # último close en el sheet (local, pero lo convertimos a UTC para comparar)
         last_close_local = pd.to_datetime(df["Close time"].max())
-        last_close_utc = last_close_local.tz_localize(CR).tz_convert("UTC")
+
+        # =============================
+        # Manejo robusto de timezone
+        # =============================
+        if last_close_local.tzinfo is None:
+            # naive → asumimos que es hora local Costa Rica
+            last_close_utc = last_close_local.tz_localize(CR).tz_convert("UTC")
+        else:
+            # ya tiene timezone → convertir directamente
+            last_close_utc = last_close_local.tz_convert("UTC")
+
+
 
         try:
             ws = sh.worksheet(symbol)
