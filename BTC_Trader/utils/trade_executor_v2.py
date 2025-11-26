@@ -248,6 +248,10 @@ def sell_all_market(symbol):
 # =============================
 
 def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pct=None):
+    """
+    Ejecuta una compra Market usando el porcentaje del equity según PORTFOLIO_WEIGHTS.
+    ⚠️ Versión segura SIN OCO (solo market buy).
+    """
     try:
         if not BINANCE_ENABLED:
             msg = f"⚠️ {symbol}: Claves Binance ausentes. Modo solo alertas."
@@ -261,6 +265,7 @@ def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pc
             })
             return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
 
+        # ===== 1) Cálculo de monto a invertir =====
         equity = _get_spot_equity_usdt()
         free_usdt = _get_free_balance("USDT")
         weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
@@ -288,35 +293,29 @@ def handle_buy_signal(symbol, rr=None, risk_pct=None, tp_price=None, sl_limit_pc
             })
             return {"status": "INSUFFICIENT_USDT", "symbol": symbol}
 
+        # ===== 2) Market BUY =====
         print(f"🟢 Ejecutando BUY {symbol} por {usdt_to_spend:.2f} USDT (equity={equity:.2f}, balance={free_usdt:.2f})")
         buy_order = place_market_buy_by_quote(symbol, usdt_to_spend)
 
         entry_price = float(buy_order.get("price", price))
         qty = float(buy_order.get("executedQty", usdt_to_spend / price))
 
-        if tp_price is None:
-            tp_price, sl_limit, sl_trigger = compute_tp_sl(entry_price, rr, risk_pct)
-        else:
-            sl_limit = entry_price * (1 - (sl_limit_pct or DEFAULT_RISK_PCT))
-            sl_trigger = sl_limit * (1 + SL_TRIGGER_GAP)
+        # ===== 3) NO OCO POR AHORA =====
+        print(f"🎯 OCO desactivado temporalmente. SOLO BUY ejecutado para {symbol}.")
+        oco = {"status": "OCO_DISABLED"}
 
-        print(f"🎯 Colocando OCO {symbol} (TP={tp_price:.4f}, SL={sl_limit:.4f}, Trigger={sl_trigger:.4f})")
-        oco = place_oco_sell(symbol, qty, tp_price, sl_limit, sl_trigger)
-
+        # ===== 4) Log =====
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
-            "action": "BUY+OCO",
+            "action": "BUY_ONLY",
             "equity_total": equity,
             "free_usdt": free_usdt,
             "usdt_spent": usdt_to_spend,
             "entry_price": entry_price,
             "qty": qty,
-            "tp_price": tp_price,
-            "sl_price": sl_limit,
-            "sl_trigger": sl_trigger,
             "dry_run": DRY_RUN,
-            "message": "Buy ejecutado y OCO colocado correctamente"
+            "message": "Buy ejecutado (sin OCO)"
         })
 
         return {"buy": buy_order, "oco": oco}
