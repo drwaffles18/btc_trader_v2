@@ -25,29 +25,40 @@ CR = pytz.timezone("America/Costa_Rica")
 # Helpers
 # =====================================================
 
-def append_rows(ws, df):
-    """Agrega múltiples filas al Sheet."""
-    if df.empty:
-        return
-    start_row = len(ws.get_all_values()) + 1
-    values = df.astype(str).values.tolist()
-    ws.update(values=values, range_name=f"A{start_row}")
-    print(f"   ➕ {len(df)} filas agregadas al sheet")
+def append_row(ws, df_new):
+    """Inserta UNA fila sin alterar strings."""
+    next_row = len(ws.get_all_values()) + 1
+
+    values = df_new.applymap(
+        lambda x: x if isinstance(x, str) else str(x)
+    ).values.tolist()
+
+    ws.update(values=values, range_name=f"A{next_row}")
+
+
+def append_rows(ws, df_new):
+    """Inserta VARIAS filas sin alterar strings."""
+    next_row = len(ws.get_all_values()) + 1
+
+    values = df_new.applymap(
+        lambda x: x if isinstance(x, str) else str(x)
+    ).values.tolist()
+
+    end_row = next_row + len(values) - 1
+    ws.update(values=values, range_name=f"A{next_row}:G{end_row}")
 
 
 # =====================================================
-# GAP FIXER — descarga velas faltantes correctamente
+# GAP FIXER
 # =====================================================
 
 def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base):
     """
-    Detecta y repara TODAS las velas faltantes entre:
-        last_close_utc → next_open_utc
-
-    Sin incluir la vela next_open_utc (esa viene del incremental normal).
+    Repara TODAS las velas faltantes entre:
+        last_close_utc → next_open_utc (sin incluir esta última)
     """
 
-    # calcular la primera vela que falta
+    # primer open que falta:
     expected_open = last_close_utc + pd.Timedelta(milliseconds=1)
     expected_open = expected_open.floor("5min")
 
@@ -66,7 +77,6 @@ def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base
         print(f"   ❌ Error descargando velas faltantes: {e}")
         return
 
-    # filtrar SOLO las velas cuyo Open time está en el rango faltante
     df_missing = df_missing[
         (df_missing["Open time UTC"] >= expected_open) &
         (df_missing["Open time UTC"] <  next_open_utc)
@@ -76,10 +86,14 @@ def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base
         print(f"   ⚠️ No se obtuvieron velas faltantes (rango vacío).")
         return
 
-    # Ajustar columnas al formato EXACTO del sheet
-    df_missing["Open time"]  = df_missing["Open time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
-    df_missing["Close time"] = (df_missing["Close time"] - pd.Timedelta(milliseconds=1))
-    df_missing["Close time"] = df_missing["Close time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+    # convertir al formato EXACTO del sheet
+    df_missing["Open time"] = df_missing["Open time"].apply(
+        lambda dt: dt.isoformat(" ")
+    )
+
+    df_missing["Close time"] = df_missing["Close time"].apply(
+        lambda dt: (dt - pd.Timedelta(milliseconds=1)).isoformat(" ")
+    )
 
     df_missing = df_missing[[
         "Open time","Open","High","Low","Close","Volume","Close time"
@@ -87,6 +101,7 @@ def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base
 
     print(f"   ➕ Se agregarán {len(df_missing)} velas faltantes...")
     append_rows(ws, df_missing)
+
 
 
 # =====================================================
@@ -115,13 +130,14 @@ def main():
         else:
             last_close_utc = last_close_local.tz_convert("UTC")
 
+        # obtener worksheet
         try:
             ws = sh.worksheet(symbol)
         except:
             raise RuntimeError(f"❌ La hoja {symbol} no existe.")
 
         # ============================
-        # Pedir última vela 5m cerrada
+        # última vela real en Binance
         # ============================
         preferred_base = None
         for base in bases_para(symbol):
@@ -152,7 +168,6 @@ def main():
             print(f"   ✓ No hay vela nueva para agregar.")
             continue
 
-        # convertir a hora local
         open_local  = k_open_utc.tz_convert(CR)
         close_local = (k_close_utc.tz_convert(CR) - pd.Timedelta(milliseconds=1))
 
