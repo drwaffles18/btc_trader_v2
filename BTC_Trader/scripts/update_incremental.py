@@ -107,14 +107,15 @@ def main():
         # ENTRAR AL GSHEET EXACTAMENTE COMO EL HISTÓRICO
         # -----------------------------------------
         row = {
-            "Open time":  k_open_local.strftime("%Y-%m-%d %H:%M:%S"),
+            "Open time":  k_open_local.isoformat(" "),
             "Open":       float(kline[1]),
             "High":       float(kline[2]),
             "Low":        float(kline[3]),
             "Close":      float(kline[4]),
             "Volume":     float(kline[5]),
-            "Close time": k_close_local.strftime("%Y-%m-%d %H:%M:%S.%f")
+            "Close time": k_close_local.isoformat(" ")
         }
+
 
         df_new = pd.DataFrame([row])
         append_row(ws, df_new)
