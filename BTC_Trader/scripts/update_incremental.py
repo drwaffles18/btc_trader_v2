@@ -9,67 +9,110 @@ sys.path.append(ROOT)
 
 from utils.google_client import get_gsheet_client
 from utils.load_from_sheets import load_symbol_df
-from utils.binance_fetch import fetch_last_closed_kline_5m, bases_para
-from repair_gaps import repair_gaps   # 👈 NUEVO
+from utils.binance_fetch import (
+    fetch_last_closed_kline_5m,
+    bases_para,
+    get_binance_5m_data_between
+)
 
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
-CR = pytz.timezone("America/Costa_Rica")   # zona horaria de tu histórico
+CR = pytz.timezone("America/Costa_Rica")
 
-# =================================================
+
+# =====================================================
 # Helpers
-# =================================================
+# =====================================================
 
-def normalize_utc(ms):
-    """Convierte timestamp en ms → UTC redondeado a 5m."""
-    ts = pd.to_datetime(ms, unit="ms", utc=True)
-    return ts.floor("5min")
+def append_rows(ws, df):
+    """Agrega múltiples filas al Sheet."""
+    if df.empty:
+        return
+    start_row = len(ws.get_all_values()) + 1
+    values = df.astype(str).values.tolist()
+    ws.update(values=values, range_name=f"A{start_row}")
+    print(f"   ➕ {len(df)} filas agregadas al sheet")
 
-def append_row(ws, df_new):
-    """Inserta una fila al final del sheet."""
-    next_row = len(ws.get_all_values()) + 1
-    ws.update(
-        values=df_new.astype(str).values.tolist(),
-        range_name=f"A{next_row}"
-    )
 
-# =================================================
+# =====================================================
+# GAP FIXER — descarga velas faltantes correctamente
+# =====================================================
+
+def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base):
+    """
+    Detecta y repara TODAS las velas faltantes entre:
+        last_close_utc → next_open_utc
+
+    Sin incluir la vela next_open_utc (esa viene del incremental normal).
+    """
+
+    # calcular la primera vela que falta
+    expected_open = last_close_utc + pd.Timedelta(milliseconds=1)
+    expected_open = expected_open.floor("5min")
+
+    if expected_open >= next_open_utc:
+        print(f"   ✓ {symbol}: sin gaps (expected_open == next_open_utc).")
+        return
+
+    print(f"   ⚠️ Hay gaps para {symbol}. Descargando rango completo...")
+
+    start_str = expected_open.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
+    end_str   = next_open_utc.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        df_missing = get_binance_5m_data_between(symbol, start_str, end_str)
+    except Exception as e:
+        print(f"   ❌ Error descargando velas faltantes: {e}")
+        return
+
+    # filtrar SOLO las velas cuyo Open time está en el rango faltante
+    df_missing = df_missing[
+        (df_missing["Open time UTC"] >= expected_open) &
+        (df_missing["Open time UTC"] <  next_open_utc)
+    ].copy()
+
+    if df_missing.empty:
+        print(f"   ⚠️ No se obtuvieron velas faltantes (rango vacío).")
+        return
+
+    # Ajustar columnas al formato EXACTO del sheet
+    df_missing["Open time"]  = df_missing["Open time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+    df_missing["Close time"] = (df_missing["Close time"] - pd.Timedelta(milliseconds=1))
+    df_missing["Close time"] = df_missing["Close time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+
+    df_missing = df_missing[[
+        "Open time","Open","High","Low","Close","Volume","Close time"
+    ]]
+
+    print(f"   ➕ Se agregarán {len(df_missing)} velas faltantes...")
+    append_rows(ws, df_missing)
+
+
+# =====================================================
 # MAIN
-# =================================================
+# =====================================================
 
 def main():
-    print("🔄 Iniciando actualización incremental...")
+    print("🔄 Iniciando actualización incremental con gap fixing...")
 
     client = get_gsheet_client()
     sh = client.open_by_key(SHEET_ID)
 
     for symbol in SYMBOLS:
-        print(f"\n➡️ {symbol}")
+        print(f"\n➡️ Procesando {symbol}...")
 
-        df = load_symbol_df(symbol)
+        df_sheet = load_symbol_df(symbol)
 
-        # último close en el sheet (local, pero lo convertimos a UTC para comparar)
-        last_close_local = pd.to_datetime(df["Close time"].max())
+        # última vela conocida en el sheet
+        last_close_local = pd.to_datetime(df_sheet["Close time"].max())
 
-        # ==================================
-        # Fix: manejar NaT (sheet vacío)
-        # ==================================
         if pd.isna(last_close_local):
-            # Si el sheet está vacío, este incremental no debería intentar
-            # backfillear toda la historia. Para eso está el histórico total.
-            # Dejamos una fecha muy vieja para que, si por alguna razón se usa,
-            # no rompa comparaciones.
             last_close_local = pd.Timestamp("2000-01-01 00:00:00", tz=CR)
 
-        # =============================
-        # Manejo robusto de timezone
-        # =============================
         if last_close_local.tzinfo is None:
-            # naive → asumimos que es hora local Costa Rica
             last_close_utc = last_close_local.tz_localize(CR).tz_convert("UTC")
         else:
-            # ya tiene timezone → convertir directamente
             last_close_utc = last_close_local.tz_convert("UTC")
 
         try:
@@ -77,69 +120,58 @@ def main():
         except:
             raise RuntimeError(f"❌ La hoja {symbol} no existe.")
 
-        # Intentar descargar desde las bases
+        # ============================
+        # Pedir última vela 5m cerrada
+        # ============================
+        preferred_base = None
         for base in bases_para(symbol):
             try:
-                kline, open_ms, close_ms, _ = fetch_last_closed_kline_5m(symbol, base)
+                kline, open_ms, close_ms, server_ms = fetch_last_closed_kline_5m(symbol, base)
+                preferred_base = base
                 break
             except Exception as e:
                 print(f"   ✗ {base} falló: {e}")
                 continue
 
-        # timestamps de Binance → UTC (abertura y cierre)
-        k_open_utc  = normalize_utc(open_ms)
-        k_close_utc = normalize_utc(close_ms)
-
-        # Si no es nueva, salir
-        if k_close_utc <= last_close_utc:
-            print(f"   ✓ No hay velas nuevas (última = {last_close_utc}, incremental = {k_close_utc})")
+        if preferred_base is None:
+            print(f"❌ {symbol}: no se pudo obtener la última vela 5m desde ninguna base.")
             continue
 
-        # =====================================================
-        # GAPS: detectar si faltan candelas intermedias
-        # =====================================================
-        # Derivamos el open time de la última vela que ya tienes en el sheet
-        # a partir de su close (last_close_utc ~ XX:XX:59.999)
-        last_open_utc = (last_close_utc + pd.Timedelta(milliseconds=1)).floor("5min") - pd.Timedelta(minutes=5)
+        k_open_utc  = pd.to_datetime(open_ms,  unit="ms", utc=True)
+        k_close_utc = pd.to_datetime(close_ms, unit="ms", utc=True)
 
-        delta_sec = (k_open_utc - last_open_utc).total_seconds()
-        missing_candles = int(delta_sec // 300)  # 300 seg = 5 min
+        # ============================
+        # GAP FIXER
+        # ============================
+        fix_gaps(symbol, df_sheet, last_close_utc, k_open_utc, ws, preferred_base)
 
-        if missing_candles > 1:
-            print(f"   ⚠️ Se detectaron {missing_candles - 1} candelas faltantes para {symbol}.")
-            # Repara SOLO las intermedias (no incluye la vela de k_open_utc)
-            repair_gaps(symbol, ws, last_open_utc, k_open_utc)
-        else:
-            print(f"   ✓ {symbol}: sin gaps, solo se agregará la nueva vela.")
+        # ============================
+        # Agregar la vela más reciente
+        # ============================
+        if k_close_utc <= last_close_utc:
+            print(f"   ✓ No hay vela nueva para agregar.")
+            continue
 
-        # -----------------------------------------
-        # Convertir UTC → hora local de Costa Rica
-        # -----------------------------------------
-        k_open_local = k_open_utc.tz_convert(CR)
-        k_close_local = k_close_utc.tz_convert(CR)
+        # convertir a hora local
+        open_local  = k_open_utc.tz_convert(CR)
+        close_local = (k_close_utc.tz_convert(CR) - pd.Timedelta(milliseconds=1))
 
-        # Ajustar el close time a XX:XX:59.999000
-        k_close_local = (k_close_local - pd.Timedelta(milliseconds=1))
-
-        # -----------------------------------------
-        # ENTRAR AL GSHEET EXACTAMENTE COMO EL HISTÓRICO
-        # -----------------------------------------
         row = {
-            "Open time":  k_open_local.isoformat(" "),
+            "Open time":  open_local.isoformat(" "),
             "Open":       float(kline[1]),
             "High":       float(kline[2]),
             "Low":        float(kline[3]),
             "Close":      float(kline[4]),
             "Volume":     float(kline[5]),
-            "Close time": k_close_local.isoformat(" ")
+            "Close time": close_local.isoformat(" ")
         }
 
-        df_new = pd.DataFrame([row])
-        append_row(ws, df_new)
+        append_rows(ws, pd.DataFrame([row]))
 
         print(f"   ✓ Vela agregada: {row['Open time']} → {row['Close time']}")
 
-    print("\n🎉 Incremental completado sin duplicados ni gaps.")
+    print("\n🎉 Incremental completado sin gaps y sin duplicados.")
+
 
 if __name__ == "__main__":
     main()
