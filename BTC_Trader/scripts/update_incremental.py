@@ -42,24 +42,22 @@ def ensure_capacity(ws, required_last_row: int) -> None:
 def purge_old_rows(ws, max_keep: int = 1200) -> None:
     """
     Mantiene como máximo `max_keep` filas con datos (incluyendo encabezado).
-
-    Mantiene:
-      - Fila 1: encabezado
-      - Fila 2: primer dato reciente
-      - Desde fila 3 borra todo lo extra si excede max_keep
+    Borra desde la fila 2 hacia adelante.
     """
-    used_rows = len(ws.col_values(1))  # número real de filas usadas
+    used_rows = len(ws.col_values(1))
 
     if used_rows <= max_keep:
         return
 
     excess = used_rows - max_keep
-    start_index = 3
-    end_index = start_index + excess - 1
+
+    start_index = 2          # <── AHORA BORRA DESDE LA FILA 2
+    end_index   = start_index + excess - 1
 
     print(f"[purge_old_rows] Podando filas {start_index} → {end_index} (total usadas: {used_rows})")
 
     ws.delete_rows(start_index, end_index)
+
 
 
 def append_rows(ws, df, max_keep: int = 1200) -> None:
