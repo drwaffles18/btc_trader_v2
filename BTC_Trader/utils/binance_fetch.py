@@ -1,22 +1,24 @@
-# utils/binance_fetch.py
-# Fetch de velas 4h con mirror público y binance.us + utilidades para pedir la ÚLTIMA vela cerrada (UTC)
-
 import os
 import requests
 import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import time
+import pytz
+
+# ============================================================
+# CONFIGURACIÓN GLOBAL
+# ============================================================
 
 US_HOST = (os.getenv("BINANCE_US_URL") or "https://api.binance.us").rstrip("/")
 MIRROR  = (os.getenv("BINANCE_MIRROR_URL") or "https://data-api.binance.vision").rstrip("/")
+API_BINANCE = "https://api.binance.com"
 
-# Símbolos que normalmente están en .US (tu config actual incluye XRPUSDT)
-US_SYMBOLS   = {"BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT"}   # sin BNB que está en Mirror
-MIRROR_FIRST = {"BNBUSDT"}                                     # estos primero al MIRROR
+US_SYMBOLS   = {"BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT"}
+MIRROR_FIRST = {"BNBUSDT"}
 
 _HEADERS = {"User-Agent": "VictorTradingApp/1.0 (+railway)"}
 
-# Reintentos ligeros para 429/5xx
 _session = requests.Session()
 _retry = Retry(
     total=2,
@@ -28,71 +30,84 @@ _adapter = HTTPAdapter(max_retries=_retry)
 _session.mount("http://", _adapter)
 _session.mount("https://", _adapter)
 
-# Cache: host que funcionó por símbolo
 _PREFERRED_BASE = {}
 
-# =========================
-# Selección de bases (orden por símbolo) + preferencia aprendida
-# =========================
+
+
+# ============================================================
+# SELECTORES DE BASES (4H y “última vela cerrada”)
+# ============================================================
+
 def _bases_for(symbol: str):
-    # Mantén tu orden por símbolo (sin globales)
+    """Bases solo para histórico 4H y fallback general."""
     if symbol in MIRROR_FIRST:
         bases = [MIRROR, US_HOST]
     elif symbol in US_SYMBOLS:
-        bases = [MIRROR, US_HOST]  # histórico primero; cambiamos a .US primero en la función de “última cerrada”
+        bases = [MIRROR, US_HOST]
     else:
         bases = [MIRROR, US_HOST]
 
-    # Reubica hint de host preferido si existe
     hint = _PREFERRED_BASE.get(symbol)
     if hint and hint in bases:
         bases = [hint] + [b for b in bases if b != hint]
+
     return bases
+
 
 def bases_para(symbol: str):
     """
-    Para la última vela cerrada en vivo, preferimos .US para symbols soportados
-    y dejamos MIRROR como fallback. Mantiene también el hint preferido.
+    Para la última vela CERRADA (5m / 4h)
+    Funcionan bien US_HOST y MIRROR.
     """
     if symbol in US_SYMBOLS:
         bases = [US_HOST, MIRROR]
     else:
         bases = [MIRROR, US_HOST]
+
     hint = _PREFERRED_BASE.get(symbol)
     if hint and hint in bases:
         bases = [hint] + [b for b in bases if b != hint]
+
     return bases
 
-# =========================
-# Fetch histórico (tu función original)
-# =========================
+
+
+# ============================================================
+# FETCH HISTÓRICO SIMPLE (4H / 5M — pero 5M NO SE USA AQUÍ)
+# ============================================================
+
 def _fetch_klines(base: str, symbol: str, interval: str, limit: int, timeout: int = 12):
     url = f"{base}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = _session.get(url, params=params, timeout=timeout, headers=_HEADERS)
-    # 451/403 = bloqueos → saltar a siguiente base
+
     if r.status_code in (451, 403):
         raise requests.HTTPError(f"{r.status_code} from {base}", response=r)
+
     r.raise_for_status()
     data = r.json()
+
     if not isinstance(data, list):
         raise ValueError(f"Formato inesperado desde {base}: {data}")
+
     return data
 
+
+
+# ============================================================
+# HISTÓRICO 4H (permanece igual)
+# ============================================================
+
 def get_binance_4h_data(symbol: str, limit: int = 300, preferred_base: str = None) -> pd.DataFrame:
-    """
-    Descarga velas 4h desde MIRROR/.US.
-    Si preferred_base está presente y soportada, la prueba primero para alinear cortes de vela.
-    """
     limit = max(50, min(int(limit), 1000))
     bases = _bases_for(symbol)
 
-    # NUEVO: probar primero la base preferida (la misma con la que confirmaste la última cerrada)
     if preferred_base and preferred_base in bases:
         bases = [preferred_base] + [b for b in bases if b != preferred_base]
 
     last_exc = None
     print(f"[binance_fetch] {symbol} → probando bases en orden: {bases}")
+
     for base in [b for b in bases if b]:
         try:
             data = _fetch_klines(base, symbol, "4h", limit)
@@ -103,19 +118,15 @@ def get_binance_4h_data(symbol: str, limit: int = 300, preferred_base: str = Non
             ]
             df = pd.DataFrame(data, columns=cols)
 
-            # 1) Numéricos
             for c in ["Open","High","Low","Close","Volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # 2) Tiempos (UTC)
             df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
             df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
 
-            # 3) Tiempos en CR (visual)
             df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
             df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
 
-            # 4) Orden
             df = df.sort_values("Open time UTC").reset_index(drop=True)
 
             _PREFERRED_BASE[symbol] = base
@@ -125,215 +136,90 @@ def get_binance_4h_data(symbol: str, limit: int = 300, preferred_base: str = Non
         except Exception as e:
             print(f"[binance_fetch] {symbol} ✗ fallo con {base}: {e}")
             last_exc = e
-            continue
 
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
 
-def get_binance_5m_data(symbol: str, limit: int = 900, preferred_base: str = None) -> pd.DataFrame:
-    """
-    Descarga velas 5m desde MIRROR/.US.
-    - limit≈900 → ~3 días de histórico (3d * 24h * 12 velas/h = 864)
-    - preferred_base: mismo concepto que en 4h para alinear con la base usada en la "última cerrada".
-    """
-    # Limitamos por seguridad
-    limit = max(100, min(int(limit), 1000))
-    bases = _bases_for(symbol)
-
-    # Probar primero la base preferida (la usada en la última cerrada)
-    if preferred_base and preferred_base in bases:
-        bases = [preferred_base] + [b for b in bases if b != preferred_base]
-
-    last_exc = None
-    print(f"[binance_fetch] {symbol} 5m → probando bases en orden: {bases}")
-    for base in [b for b in bases if b]:
-        try:
-            data = _fetch_klines(base, symbol, "5m", limit)
-            cols = [
-                "Open time","Open","High","Low","Close","Volume",
-                "Close time","Quote asset volume","Number of trades",
-                "Taker buy base asset volume","Taker buy quote asset volume","Ignore"
-            ]
-            df = pd.DataFrame(data, columns=cols)
-
-            # 1) Numéricos
-            for c in ["Open","High","Low","Close","Volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            # 2) Tiempos (UTC)
-            df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
-            df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
-
-            # 3) Tiempos en CR (visual)
-            df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
-            df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
-
-            # 4) Orden por tiempo
-            df = df.sort_values("Open time UTC").reset_index(drop=True)
-
-            _PREFERRED_BASE[symbol] = base
-            print(f"[binance_fetch] {symbol} 5m ✓ usando base: {base}")
-            return df
-
-        except Exception as e:
-            print(f"[binance_fetch] {symbol} 5m ✗ fallo con {base}: {e}")
-            last_exc = e
-            continue
-
-    raise last_exc or RuntimeError(f"No se pudo obtener klines 5m para {symbol}")
 
 
-# =========================
-# NUEVO: ajuste para 5 minutos!
-# =========================
+# ============================================================
+# ÚLTIMA VELA CERRADA (5m)
+# ============================================================
 
-
-FIVE_MIN_MS = 5 * 60 * 1000  # 5 minutos en ms
+FIVE_MIN_MS = 5 * 60 * 1000
 
 def _floor_interval_utc(ts_ms: int, interval_ms: int) -> int:
     return (ts_ms // interval_ms) * interval_ms
 
 def last_closed_window_5m(server_time_ms: int):
-    """
-    Última vela 5m CERRADA (UTC): [open_ms, close_ms)
-    """
     last_close = _floor_interval_utc(server_time_ms, FIVE_MIN_MS)
     last_open  = last_close - FIVE_MIN_MS
     return last_open, last_close
 
 
-
-# =========================
-# NUEVO: pedir EXPLÍCITAMENTE la ÚLTIMA vela 4h CERRADA (UTC)
-# =========================
-FOUR_H_MS = 4 * 60 * 60 * 1000
-
-def _floor_4h_utc(ts_ms: int) -> int:
-    return (ts_ms // FOUR_H_MS) * FOUR_H_MS
-
-def last_closed_window(server_time_ms: int):
-    """
-    Devuelve [open_ms, close_ms) de la ÚLTIMA vela 4H CERRADA en UTC,
-    usando la hora del servidor de Binance.
-    """
-    last_close = _floor_4h_utc(server_time_ms)
-    last_open  = last_close - FOUR_H_MS
-    return last_open, last_close
-
-def fetch_last_closed_kline(symbol: str, base_url: str, session=None):
-    """
-    Pide exactamente la última vela 4H CERRADA vía REST,
-    apuntando con endTime=last_close-1 para evitar velas en formación.
-    Devuelve: (kline, last_open_ms, last_close_ms, server_time_ms)
-    """
-    s = session or _session
-
-    # 1) Hora del servidor (UTC)
-    r = s.get(f"{base_url}/api/v3/time", headers=_HEADERS, timeout=5)
-    r.raise_for_status()
-    server_time_ms = r.json()["serverTime"]
-
-    # 2) Ventana de la vela cerrada
-    last_open, last_close = last_closed_window(server_time_ms)
-
-    # 3) Kline cerrada apuntando a endTime=last_close-1 (inclusivo)
-    params = dict(symbol=symbol, interval="4h", limit=1, endTime=last_close - 1)
-    r = s.get(f"{base_url}/api/v3/klines", params=params, headers=_HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        raise RuntimeError(f"[{symbol}] Sin datos de kline desde {base_url}")
-
-    k = data[0]
-    k_open = int(k[0])
-    if k_open != last_open:
-        raise RuntimeError(f"[{symbol}] {base_url} devolvió open={k_open}, esperado={last_open}")
-
-    # hint de base preferida al tener éxito
-    _PREFERRED_BASE[symbol] = base_url
-    return k, last_open, last_close, server_time_ms
-
 def fetch_last_closed_kline_5m(symbol: str, base_url: str, session=None):
-    """
-    Pide exactamente la última vela 5m CERRADA vía REST,
-    apuntando con endTime=last_close-1 para evitar velas en formación.
-    Devuelve: (kline, last_open_ms, last_close_ms, server_time_ms)
-    """
     s = session or _session
 
-    # 1) Hora del servidor (UTC)
     r = s.get(f"{base_url}/api/v3/time", headers=_HEADERS, timeout=5)
     r.raise_for_status()
     server_time_ms = r.json()["serverTime"]
 
-    # 2) Ventana de la vela cerrada 5m
     last_open, last_close = last_closed_window_5m(server_time_ms)
 
-    # 3) Kline cerrada apuntando a endTime=last_close-1 (inclusivo)
     params = dict(symbol=symbol, interval="5m", limit=1, endTime=last_close - 1)
     r = s.get(f"{base_url}/api/v3/klines", params=params, headers=_HEADERS, timeout=10)
     r.raise_for_status()
+
     data = r.json()
     if not data:
         raise RuntimeError(f"[{symbol}] Sin datos de kline 5m desde {base_url}")
 
     k = data[0]
     k_open = int(k[0])
-    if k_open != last_open:
-        raise RuntimeError(f"[{symbol}] {base_url} 5m devolvió open={k_open}, esperado={last_open}")
 
-    # hint de base preferida
+    if k_open != last_open:
+        raise RuntimeError(f"[{symbol}] {base_url} devolvió open={k_open}, esperado={last_open}")
+
     _PREFERRED_BASE[symbol] = base_url
     return k, last_open, last_close, server_time_ms
 
-# =============================================================
-# NUEVO: Descarga histórico completo 5m entre fechas
-# =============================================================
-import time
-from datetime import datetime, timezone
+
+
+# ============================================================
+# *** HISTÓRICO 5M ENTRE FECHAS (VERSIÓN ESTABLE) ***
+# ============================================================
 
 def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, preferred_base=None):
     """
-    Descarga TODO el histórico 5m entre start_dt y end_dt usando paginación automática,
-    respetando la base preferida (para evitar velas planas/inventadas).
+    Descarga histórico EXACTO 5m entre start_dt y end_dt.
+    SOLO DESDE api.binance.com (para evitar velas basura).
     """
 
-    # === 1) Convertir fechas a ms UTC ===
+    # === 1) convertir fechas ===
     start_ms = int(pd.Timestamp(start_dt, tz="UTC").timestamp() * 1000)
 
-    # === 2) Determinar end_ms (si no se da) ===
     if end_dt is None:
-        # IMPORTANTE: usar la base preferida para sincronizar con el servidor correcto
-        base_for_time = preferred_base or US_HOST
+        base_for_time = API_BINANCE
         r = _session.get(f"{base_for_time}/api/v3/time", timeout=5, headers=_HEADERS)
         r.raise_for_status()
-        server_time = r.json()["serverTime"]
-        end_ms = int(server_time)
+        end_ms = int(r.json()["serverTime"])
     else:
         end_ms = int(pd.Timestamp(end_dt, tz="UTC").timestamp() * 1000)
 
     print(f"[binance_fetch] HISTÓRICO {symbol} 5m → desde {start_dt} hasta {pd.to_datetime(end_ms, unit='ms')}")
+    print(f"[binance_fetch] base: [{API_BINANCE}] (forzado)")
 
-    # === 3) Orden de bases ===
-    bases = _bases_for(symbol)
-    if preferred_base and preferred_base in bases:
-        bases = [preferred_base] + [b for b in bases if b != preferred_base]
+    bases = [API_BINANCE]   # <---- LA CLAVE
 
-    print(f"[binance_fetch] bases: {bases}")
-
-    # === 4) Preparación ===
     frames = []
     fetch_size = 1000
     current_start = start_ms
 
-    # === 5) Ciclo de paginación ===
     while current_start < end_ms:
 
         current_end = min(current_start + fetch_size * FIVE_MIN_MS, end_ms)
-
         last_exc = None
         data = None
 
-        # === PROBAR CADA BASE ===
         for base in bases:
             try:
                 url = f"{base}/api/v3/klines"
@@ -346,32 +232,20 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, 
                 }
 
                 resp = _session.get(url, params=params, timeout=10, headers=_HEADERS)
-
-                # saltar bloqueos
-                if resp.status_code in (451, 403):
-                    raise requests.HTTPError(f"{resp.status_code} from {base}", response=resp)
-
                 resp.raise_for_status()
                 data = resp.json()
-
-                if isinstance(data, list):
-                    _PREFERRED_BASE[symbol] = base  # memorizar
-                    break
-
-                raise ValueError(f"Formato inesperado: {data}")
+                break
 
             except Exception as e:
                 print(f"[binance_fetch] {symbol} 5m ✗ fallo con {base}: {e}")
                 last_exc = e
-                continue
 
         if data is None:
             raise last_exc
 
         if len(data) == 0:
-            break  # no más velas en el rango
+            break
 
-        # === Convertir respuesta ===
         cols = [
             "Open time","Open","High","Low","Close","Volume",
             "Close time","Quote asset volume","Number of trades",
@@ -379,39 +253,27 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, 
         ]
         df = pd.DataFrame(data, columns=cols)
 
-        # numéricos
         for c in ["Open","High","Low","Close","Volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # tiempos
         df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
         df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
 
-        # CR visual
         df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
         df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
 
         frames.append(df)
 
-        # avance del puntero
         last_close_ms = int(df["Close time UTC"].iloc[-1].timestamp() * 1000)
         current_start = last_close_ms + FIVE_MIN_MS
 
-        time.sleep(0.08)  # respetuoso con el API
+        time.sleep(0.08)
 
     if not frames:
-        raise RuntimeError(f"No se obtuvo histórico 5m para {symbol}")
+        raise RuntimeError(f"No se obtuvo historial 5m para {symbol}")
 
     final_df = pd.concat(frames, ignore_index=True)
     final_df = final_df.sort_values("Open time UTC").reset_index(drop=True)
 
-    print(f"[binance_fetch] ✓ obtenido histórico completo: {len(final_df)} velas (consistente).")
+    print(f"[binance_fetch] ✓ obtenido histórico consistente: {len(final_df)} velas.")
     return final_df
-
-
-
-
-
-
-
-
