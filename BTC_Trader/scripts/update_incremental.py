@@ -2,7 +2,7 @@ import sys
 import os
 import pandas as pd
 
-# Fix import paths
+# Fix paths
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(ROOT)
 
@@ -13,31 +13,30 @@ from utils.binance_fetch import fetch_last_closed_kline_5m, bases_para
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
 
-TZ_LOCAL = "America/Chicago"   # 👈 tu zona (-06:00)
+# =================================================
+# Helpers
+# =================================================
 
-
-# ==========================================
-# Normalizar timestamps correctamente
-# ==========================================
 def normalize_utc(ms):
     """Convierte timestamp en ms → UTC redondeado a 5m."""
     ts = pd.to_datetime(ms, unit="ms", utc=True)
     return ts.floor("5min")
 
 
-def to_local(ts_utc):
-    """Convierte TS UTC → hora local sin tzinfo (string limpio)."""
-    return ts_utc.tz_convert(TZ_LOCAL).tz_localize(None)
-
-
-def append_rows(ws, df_new):
-    # insertar al final
+def append_row(ws, df_new):
+    """Inserta una fila al final del sheet."""
     next_row = len(ws.get_all_values()) + 1
+
+    # nuevo formato: values first, luego range
     ws.update(
-        range_name=f"A{next_row}",
-        values=df_new.astype(str).values.tolist()
+        values=df_new.astype(str).values.tolist(),
+        range_name=f"A{next_row}"
     )
 
+
+# =================================================
+# MAIN
+# =================================================
 
 def main():
     print("🔄 Iniciando actualización incremental...")
@@ -49,14 +48,17 @@ def main():
         print(f"\n➡️ {symbol}")
 
         df = load_symbol_df(symbol)
+
+        # último close en el sheet, normalizado
         last_close = normalize_utc(df["Close time"].max())
 
+        # abrir hoja
         try:
             ws = sh.worksheet(symbol)
         except:
             raise RuntimeError(f"❌ La hoja {symbol} no existe.")
 
-        # intentar descargar desde varias bases HTTP
+        # intentar cada base de Binance
         for base in bases_para(symbol):
             try:
                 kline, open_ms, close_ms, _ = fetch_last_closed_kline_5m(symbol, base)
@@ -65,20 +67,29 @@ def main():
                 print(f"   ✗ {base} falló: {e}")
                 continue
 
-        # normalizar timestamps
+        # Convertir timestamps Binance → UTC
         k_open_utc = normalize_utc(open_ms)
         k_close_utc = normalize_utc(close_ms)
 
-        # convertir a hora local (SIN TZ)
-        k_open_local = to_local(k_open_utc)
-        k_close_local = to_local(k_close_utc)
-
-        # anti-duplicados: comparar en UTC
+        # Anti-duplicado real
         if k_close_utc <= last_close:
             print(f"   ✓ No hay velas nuevas (última = {last_close}, incremental = {k_close_utc}).")
             continue
 
-        # construir fila con STRINGS LOCALES
+        # ==========================================================
+        # Convertir UTC → CST (-06:00)
+        # ==========================================================
+        k_open_local = k_open_utc.tz_convert("America/Costa_Rica")
+        k_close_local = k_close_utc.tz_convert("America/Costa_Rica")
+
+        # ==========================================================
+        # Ajuste del close time: 19:15:00 → 19:14:59.999000
+        # ==========================================================
+        k_close_local = k_close_local - pd.Timedelta(milliseconds=1)
+
+        # ==========================================================
+        # Construir fila EXACTA como el histórico completo
+        # ==========================================================
         row = {
             "Open time": k_open_local.strftime("%Y-%m-%d %H:%M:%S"),
             "Open": float(kline[1]),
@@ -86,13 +97,13 @@ def main():
             "Low": float(kline[3]),
             "Close": float(kline[4]),
             "Volume": float(kline[5]),
-            "Close time": k_close_local.strftime("%Y-%m-%d %H:%M:%S")
+            "Close time": k_close_local.strftime("%Y-%m-%d %H:%M:%S.%f")
         }
 
         df_new = pd.DataFrame([row])
-        append_rows(ws, df_new)
+        append_row(ws, df_new)
 
-        print(f"   ✓ Agregada nueva vela local: {row['Close time']}")
+        print(f"   ✓ Agregada nueva vela: {k_open_local} → {k_close_local}")
 
     print("\n🎉 Incremental completado sin duplicados.")
 
