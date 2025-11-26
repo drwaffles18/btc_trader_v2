@@ -191,14 +191,16 @@ def fetch_last_closed_kline_5m(symbol: str, base_url: str, session=None):
 def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, preferred_base=None):
     """
     Descarga histórico EXACTO 5m entre start_dt y end_dt.
-    SOLO DESDE api.binance.com (para evitar velas basura).
+    SOLO DESDE Binance Vision (SIN GEO RESTRICCIONES).
     """
 
     # === 1) convertir fechas ===
     start_ms = int(pd.Timestamp(start_dt, tz="UTC").timestamp() * 1000)
 
+    # === 2) Determinar end_ms ===
     if end_dt is None:
-        base_for_time = API_BINANCE
+        # USAR SIEMPRE BINANCE VISION (NO tiene bloqueos)
+        base_for_time = MIRROR  
         r = _session.get(f"{base_for_time}/api/v3/time", timeout=5, headers=_HEADERS)
         r.raise_for_status()
         end_ms = int(r.json()["serverTime"])
@@ -206,9 +208,10 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, 
         end_ms = int(pd.Timestamp(end_dt, tz="UTC").timestamp() * 1000)
 
     print(f"[binance_fetch] HISTÓRICO {symbol} 5m → desde {start_dt} hasta {pd.to_datetime(end_ms, unit='ms')}")
-    print(f"[binance_fetch] base: [{API_BINANCE}] (forzado)")
+    print(f"[binance_fetch] base: [{MIRROR}] (forzado)")
 
-    bases = [API_BINANCE]   # <---- LA CLAVE
+    # ========== USAR SOLO BINANCE VISION ==========
+    bases = [MIRROR]
 
     frames = []
     fetch_size = 1000
@@ -277,3 +280,5 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, 
 
     print(f"[binance_fetch] ✓ obtenido histórico consistente: {len(final_df)} velas.")
     return final_df
+
+
