@@ -51,7 +51,13 @@ def main():
 
         # último close en el sheet (local, pero lo convertimos a UTC para comparar)
         last_close_local = pd.to_datetime(df["Close time"].max())
-
+        
+        # ==================================
+        # Fix: manejar NaT (sheet vacío)
+        # ==================================
+        if pd.isna(last_close_local):
+            last_close_local = pd.Timestamp("2000-01-01 00:00:00")
+        
         # =============================
         # Manejo robusto de timezone
         # =============================
@@ -61,6 +67,7 @@ def main():
         else:
             # ya tiene timezone → convertir directamente
             last_close_utc = last_close_local.tz_convert("UTC")
+
 
 
 
