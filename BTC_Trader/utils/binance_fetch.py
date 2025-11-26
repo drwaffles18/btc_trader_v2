@@ -56,19 +56,11 @@ def _bases_for(symbol: str):
 
 def bases_para(symbol: str):
     """
-    Para la última vela CERRADA (5m / 4h)
-    Funcionan bien US_HOST y MIRROR.
+    Para la última vela cerrada SIEMPRE usamos api.binance.com.
+    Es la única base 100% confiable para velas en tiempo real.
     """
-    if symbol in US_SYMBOLS:
-        bases = [US_HOST, MIRROR]
-    else:
-        bases = [MIRROR, US_HOST]
+    return ["https://api.binance.com"]
 
-    hint = _PREFERRED_BASE.get(symbol)
-    if hint and hint in bases:
-        bases = [hint] + [b for b in bases if b != hint]
-
-    return bases
 
 
 
@@ -280,5 +272,6 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, 
 
     print(f"[binance_fetch] ✓ obtenido histórico consistente: {len(final_df)} velas.")
     return final_df
+
 
 
