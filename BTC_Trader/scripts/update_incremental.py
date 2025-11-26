@@ -54,52 +54,55 @@ def append_rows(ws, df_new):
 
 def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base):
     """
-    Repara TODAS las velas faltantes entre:
-        last_close_utc → next_open_utc (sin incluir esta última)
+    Detecta y repara TODAS las velas faltantes entre:
+        last_close_utc → next_open_utc
     """
 
-    # primer open que falta:
+    # PRIMERA vela que debería existir
     expected_open = last_close_utc + pd.Timedelta(milliseconds=1)
     expected_open = expected_open.floor("5min")
 
     if expected_open >= next_open_utc:
-        print(f"   ✓ {symbol}: sin gaps (expected_open == next_open_utc).")
+        print(f"   ✓ {symbol}: sin gaps.")
         return
 
-    print(f"   ⚠️ Hay gaps para {symbol}. Descargando rango completo...")
+    print(f"   ⚠️ {symbol}: Hay gaps. Descargando histórico exacto...")
 
     start_str = expected_open.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
     end_str   = next_open_utc.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
 
-    try:
-        df_missing = get_binance_5m_data_between(symbol, start_str, end_str)
-    except Exception as e:
-        print(f"   ❌ Error descargando velas faltantes: {e}")
-        return
+    # === USAR preferred_base ===
+    df_missing = get_binance_5m_data_between(
+        symbol,
+        start_str,
+        end_str,
+        preferred_base=preferred_base
+    )
 
+    # filtrar rango exacto
     df_missing = df_missing[
         (df_missing["Open time UTC"] >= expected_open) &
-        (df_missing["Open time UTC"] <  next_open_utc)
+        (df_missing["Open time UTC"] < next_open_utc)
     ].copy()
 
     if df_missing.empty:
-        print(f"   ⚠️ No se obtuvieron velas faltantes (rango vacío).")
+        print("   ⚠️ No se obtuvieron velas reales faltantes.")
         return
 
-    # convertir al formato EXACTO del sheet
-    df_missing["Open time"] = df_missing["Open time"].apply(
-        lambda dt: dt.isoformat(" ")
-    )
+    # === Ajuste final EXACTO al formato del sheet ===
 
-    df_missing["Close time"] = df_missing["Close time"].apply(
-        lambda dt: (dt - pd.Timedelta(milliseconds=1)).isoformat(" ")
-    )
+    df_missing["Open time"]  = df_missing["Open time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+
+    df_missing["Close time"] = (
+        df_missing["Close time UTC"] - pd.Timedelta(milliseconds=1)
+    ).dt.strftime("%Y-%m-%d %H:%M:%S%z")
 
     df_missing = df_missing[[
         "Open time","Open","High","Low","Close","Volume","Close time"
     ]]
 
-    print(f"   ➕ Se agregarán {len(df_missing)} velas faltantes...")
+    print(f"   ➕ Se agregarán {len(df_missing)} velas faltantes reales...")
+
     append_rows(ws, df_missing)
 
 
