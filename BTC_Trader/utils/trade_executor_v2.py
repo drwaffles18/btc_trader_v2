@@ -194,13 +194,45 @@ def compute_tp_sl(entry_price, rr=None, risk_pct=None, side="BUY", sl_trigger_ga
 # =============================
 
 def place_market_buy_by_quote(symbol, usdt_amount):
+    """
+    Ejecuta una orden MARKET BUY usando quoteOrderQty (USDT).
+    Redondea correctamente según el tick_size para evitar el error -1111.
+    """
     if not BINANCE_ENABLED:
         return {"status": "SKIPPED_NO_KEYS", "symbol": symbol}
+
+    # === Obtener tick_size del símbolo ===
+    filters = _get_symbol_filters(symbol)
+    tick = filters["tick_size"]   # Ej: ETH/USDT → 0.01
+
+    # === Convertir a Decimal para evitar errores de float ===
+    tick_dec = Decimal(str(tick))
+    amt_dec = Decimal(str(usdt_amount))
+
+    # === Redondear hacia abajo al múltiplo permitido ===
+    usdt_clean = (amt_dec // tick_dec) * tick_dec
+    usdt_clean = float(usdt_clean)
+
+    # === Simulación si estamos en DRY RUN ===
     if DRY_RUN:
         price = _get_price(symbol)
-        qty = usdt_amount / price if price else 0
-        return {"symbol": symbol, "status": "FILLED", "executedQty": str(qty), "price": str(price)}
-    return client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quoteOrderQty=str(usdt_amount))
+        qty = usdt_clean / price if price else 0
+        return {
+            "symbol": symbol,
+            "status": "FILLED",
+            "executedQty": str(qty),
+            "price": str(price)
+        }
+
+    # === Envío de orden REAL ===
+    return client.create_order(
+        symbol=symbol,
+        side=SIDE_BUY,
+        type=ORDER_TYPE_MARKET,
+        quoteOrderQty=str(usdt_clean)
+    )
+
+
 
 
 def place_oco_sell(symbol, quantity, tp_price, sl_limit_price, sl_trigger_price):
