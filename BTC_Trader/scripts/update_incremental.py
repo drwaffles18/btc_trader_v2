@@ -94,8 +94,11 @@ def fix_gaps(symbol, df_sheet, last_close_utc, next_open_utc, ws, preferred_base
     df_missing["Open time"]  = df_missing["Open time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
 
     df_missing["Close time"] = (
-        df_missing["Close time UTC"] - pd.Timedelta(milliseconds=1)
-    ).dt.strftime("%Y-%m-%d %H:%M:%S%z")
+            df_missing["Close time UTC"]
+                .dt.tz_convert("America/Costa_Rica")      # convertir UTC → CR
+                - pd.Timedelta(milliseconds=1)             # ajustar a XX:XX:59.999
+        ).dt.strftime("%Y-%m-%d %H:%M:%S.%f%z")            # formateo EXACTO
+
 
     df_missing = df_missing[[
         "Open time","Open","High","Low","Close","Volume","Close time"
