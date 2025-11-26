@@ -104,8 +104,8 @@ def main():
             "Close time": k_close_local.strftime("%Y-%m-%d %H:%M:%S.%f"),
         
             # UTC extra columns — igual que histórico completo
-            "Open time UTC": k_open_utc.strftime("%Y-%m-%d %H:%M:%S.%f%z"),
-            "Close time UTC": k_close_utc.strftime("%Y-%m-%d %H:%M:%S.%f%z"),
+            #"Open time UTC": k_open_utc.strftime("%Y-%m-%d %H:%M:%S.%f%z"), #no es algo necesario
+            #"Close time UTC": k_close_utc.strftime("%Y-%m-%d %H:%M:%S.%f%z"), #no es algo necesario
         }
 
 
