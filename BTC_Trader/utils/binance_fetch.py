@@ -131,6 +131,62 @@ def get_binance_4h_data(symbol: str, limit: int = 300, preferred_base: str = Non
 
     raise last_exc or RuntimeError(f"No se pudo obtener klines para {symbol}")
 
+def get_binance_5m_data(symbol: str, limit: int = 1000, preferred_base: str = None) -> pd.DataFrame:
+    """
+    Descarga histórico reciente de velas 5m (hasta `limit`), usando varias bases.
+    Esta es la función que usa el BOT de señales.
+    """
+    # Binance acepta entre 1 y 1000 velas por request
+    limit = max(50, min(int(limit), 1000))
+
+    bases = _bases_for(symbol)
+
+    # Respetar hint externo (cuando viene de last_closed_kline)
+    if preferred_base and preferred_base in bases:
+        bases = [preferred_base] + [b for b in bases if b != preferred_base]
+
+    last_exc = None
+    print(f"[binance_fetch] {symbol} (5m) → probando bases en orden: {bases}")
+
+    for base in [b for b in bases if b]:
+        try:
+            # llamada central reutilizable
+            data = _fetch_klines(base, symbol, "5m", limit)
+
+            cols = [
+                "Open time","Open","High","Low","Close","Volume",
+                "Close time","Quote asset volume","Number of trades",
+                "Taker buy base asset volume","Taker buy quote asset volume","Ignore"
+            ]
+            df = pd.DataFrame(data, columns=cols)
+
+            # valores numéricos
+            for c in ["Open","High","Low","Close","Volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # timestamps UTC
+            df["Open time UTC"]  = pd.to_datetime(df["Open time"],  unit="ms", utc=True)
+            df["Close time UTC"] = pd.to_datetime(df["Close time"], unit="ms", utc=True)
+
+            # convertir a CR para visualización
+            df["Open time"]  = df["Open time UTC"].dt.tz_convert("America/Costa_Rica")
+            df["Close time"] = df["Close time UTC"].dt.tz_convert("America/Costa_Rica")
+
+            df = df.sort_values("Open time UTC").reset_index(drop=True)
+
+            # memorizar host funcionó
+            _PREFERRED_BASE[symbol] = base
+            print(f"[binance_fetch] {symbol} (5m) ✓ usando base: {base}")
+            return df
+
+        except Exception as e:
+            print(f"[binance_fetch] {symbol} (5m) ✗ fallo con {base}: {e}")
+            last_exc = e
+
+    raise last_exc or RuntimeError(f"No se pudo obtener klines 5m para {symbol}")
+
+
+
 
 
 # ============================================================
@@ -272,6 +328,7 @@ def get_binance_5m_data_between(symbol: str, start_dt: str, end_dt: str = None, 
 
     print(f"[binance_fetch] ✓ obtenido histórico consistente: {len(final_df)} velas.")
     return final_df
+
 
 
 
