@@ -326,7 +326,7 @@ def handle_sell_signal(symbol):
 
         sell_price = float(_get_price(symbol))
 
-        # === Buscar último trade OPEN
+        # === Cargar trades ===
         trades = ws_trades.get_all_records()
         open_trades = [t for t in trades if t["symbol"] == symbol and t["status"] == "OPEN"]
 
@@ -335,17 +335,22 @@ def handle_sell_signal(symbol):
             return sell_res
 
         last = open_trades[-1]
-        row_idx = trades.index(last) + 2  # +2 = header + index 0
+        row_idx = trades.index(last) + 2  # header + index 0
 
         entry_price = float(last["entry_price"])
         qty = float(last["qty"])
         profit = (sell_price - entry_price) * qty
 
-        # Actualizar en Sheets
-        ws_trades.update(f"G{row_idx}", sell_price)
-        ws_trades.update(f"H{row_idx}", datetime.utcnow().isoformat())
-        ws_trades.update(f"I{row_idx}", profit)
-        ws_trades.update(f"J{row_idx}", "CLOSED")
+        # === UPDATE SEGURO (compatible con API) ===
+        ws_trades.update(
+            f"G{row_idx}:J{row_idx}",
+            [[
+                sell_price,
+                datetime.utcnow().isoformat(),
+                profit,
+                "CLOSED"
+            ]]
+        )
 
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
