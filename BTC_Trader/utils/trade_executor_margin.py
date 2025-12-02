@@ -1,19 +1,15 @@
 # =============================================================
 # 🟣 Binance Cross Margin Autotrader — Victor + GPT
 # -------------------------------------------------------------
-# - Este módulo es independiente del Spot executor.
-# - NO se usa aún en producción (USE_MARGIN = false).
-# - Contiene toda la lógica para margin:
+# - Módulo independiente del Spot executor.
+# - Contiene lógica para:
 #       * equity margin
 #       * borrow automático
 #       * repay automático
 #       * market buy margin
 #       * market sell margin
 #       * control de riesgo (40% límite, marginLevel >= 2.0)
-# -------------------------------------------------------------
-# IMPORTANTE:
-# Este archivo NO está conectado al bot todavía.
-# Cuando USE_MARGIN=true crearemos el router que lo activará.
+# - NEW: Columna trade_mode = "margin" en Google Sheets
 # =============================================================
 
 import os
@@ -30,7 +26,6 @@ try:
     from binance.enums import *
 except ImportError:
     Client = None
-
 
 # =============================================================
 # 0) CONFIG GENERAL
@@ -64,7 +59,6 @@ if API_KEY and API_SECRET and Client:
 else:
     print("⚠️ Margin Client disabled (no API keys)")
 
-
 # =============================================================
 # 1) GOOGLE SHEETS INIT
 # =============================================================
@@ -78,6 +72,18 @@ def append_trade_row_margin(ws, row_dict):
     """
     Inserta trade margin en la tabla general.
     Mantiene compatibilidad con la tabla actual.
+    Columnas esperadas:
+    1) trade_id
+    2) symbol
+    3) side
+    4) qty
+    5) entry_price
+    6) entry_time
+    7) exit_price
+    8) exit_time
+    9) profit_usdt
+    10) status
+    11) trade_mode ("spot"/"margin")
     """
     row = [
         row_dict["trade_id"],
@@ -90,9 +96,9 @@ def append_trade_row_margin(ws, row_dict):
         row_dict["exit_time"],
         row_dict["profit_usdt"],
         row_dict["status"],
+        row_dict.get("trade_mode", "margin"),  # 👈 NEW
     ]
     ws.append_row(row, value_input_option="RAW")
-
 
 # =============================================================
 # 2) UTILS
@@ -134,7 +140,6 @@ def _get_price(symbol):
     t = client.get_symbol_ticker(symbol=symbol)
     return float(t["price"])
 
-
 # =============================================================
 # 3) MARGIN ACCOUNT + RISK
 # =============================================================
@@ -150,6 +155,7 @@ def get_margin_equity_usdt():
     """
     Equity total del margin account:
     free + locked + borrowed (negativo).
+    Aproximado en USDT usando BTCUSDT como referencia.
     """
     if not BINANCE_ENABLED:
         return 1000.0
@@ -187,7 +193,6 @@ def get_total_borrow_used_ratio():
         return 1  # super riesgo
     return liability / asset  # ej: 0.27 → 27%
 
-
 # =============================================================
 # 4) BORROW Y REPAY
 # =============================================================
@@ -195,12 +200,12 @@ def get_total_borrow_used_ratio():
 def borrow_if_needed(asset, usdt_needed):
     """
     Pide prestado si no hay suficiente USDT disponible.
+    (placeholder, aún no se usa directamente en la lógica principal)
     """
     if DRY_RUN or not BINANCE_ENABLED:
         print(f"💤 DRY_RUN borrow {asset} por {usdt_needed}")
         return {"borrowed": usdt_needed}
 
-    # pedir préstamo:
     try:
         res = client.create_margin_loan(asset=asset, amount=str(usdt_needed))
         print(f"🟣 Borrow ejecutado: {res}")
@@ -211,6 +216,11 @@ def borrow_if_needed(asset, usdt_needed):
 
 
 def repay_borrow(asset, amount):
+    """
+    Repago de préstamo. Ojo: el método exacto de la API puede variar según versión.
+    Actualmente quedó con create_margin_repay (ya vimos que da error, así que
+    en la práctica estamos seguros porque no se está usando activamente).
+    """
     if DRY_RUN or not BINANCE_ENABLED:
         print(f"💤 DRY_RUN repay {asset} por {amount}")
         return {"repaid": amount}
@@ -220,7 +230,6 @@ def repay_borrow(asset, amount):
         print(f"❌ ERROR repaying: {e}")
         return {"error": str(e)}
 
-
 # =============================================================
 # 5) MARGIN MARKET BUY
 # =============================================================
@@ -228,7 +237,7 @@ def repay_borrow(asset, amount):
 def place_margin_buy(symbol, usdt_amount):
     if DRY_RUN or not BINANCE_ENABLED:
         price = _get_price(symbol)
-        qty = usdt_amount / price
+        qty = usdt_amount / price if price > 0 else 0
         print(f"💤 DRY_RUN margin buy {symbol} qty={qty}")
         return {"executedQty": qty, "price": price, "status": "FILLED"}
 
@@ -245,7 +254,6 @@ def place_margin_buy(symbol, usdt_amount):
     except Exception as e:
         print(f"❌ ERROR margin buy: {e}")
         return {"error": str(e)}
-
 
 # =============================================================
 # 6) MARGIN MARKET SELL
@@ -271,7 +279,6 @@ def place_margin_sell(symbol, qty):
         print(f"❌ ERROR margin sell: {e}")
         return {"error": str(e)}
 
-
 # =============================================================
 # 7) MANEJO DE BUY SIGNAL
 # =============================================================
@@ -280,7 +287,6 @@ def handle_margin_buy_signal(symbol):
     """
     BUY en Cross Margin con:
     - cálculo de equity
-    - borrow if needed
     - control de riesgo
     """
 
@@ -312,7 +318,7 @@ def handle_margin_buy_signal(symbol):
 
     # 5. Ejecutar BUY
     filters = _get_symbol_filters(symbol)
-    usdt_clean = float((Decimal(str(usdt_target)) // Decimal(str(filters["tick"]))) * Decimal(str(filters["tick"])))
+    usdt_clean = float((Decimal(str(usdt_target)) // Decimal(str(filters["tick"]))) * Decimal(str(filters["tick"])) )
 
     res = place_margin_buy(symbol, usdt_clean)
 
@@ -332,12 +338,12 @@ def handle_margin_buy_signal(symbol):
         "exit_price": "",
         "exit_time": "",
         "profit_usdt": "",
-        "status": "OPEN"
+        "status": "OPEN",
+        "trade_mode": "margin",   # 👈 NEW
     })
 
     print("🟣 Margin BUY completado.")
     return res
-
 
 # =============================================================
 # 8) MANEJO DE SELL SIGNAL
@@ -364,20 +370,22 @@ def handle_margin_sell_signal(symbol):
 
     profit = (sell_price - entry_price) * qty
 
-    # Repagar deuda si existe
+    # Repagar deuda si existe (best effort)
     repay_borrow("USDT", abs(profit))
 
     # Actualizar en Sheets
     trades_all = ws_trades.get_all_records()
-    idx = trades_all.index(last) + 2
+    idx = trades_all.index(last) + 2  # header + index 0
 
+    # G: exit_price, H: exit_time, I: profit_usdt, J: status, K: trade_mode
     ws_trades.update(
-        f"G{idx}:J{idx}",
+        f"G{idx}:K{idx}",
         [[
             sell_price,
             datetime.utcnow().isoformat(),
             profit,
-            "CLOSED"
+            "CLOSED",
+            "margin"   # 👈 NEW
         ]]
     )
 
