@@ -4,12 +4,11 @@
 # -------------------------------------------------------------
 # - Decide dinámicamente si usar Spot o Margin
 # - Basado en la variable de entorno USE_MARGIN
-# - Totalmente compatible con:
+# - Compatible con:
 #       * trade_executor_v2 (SPOT)
 #       * trade_executor_margin (MARGIN)
 # -------------------------------------------------------------
-# - No modifica los ejecutores existentes.
-# - El bot solo debe importar: route_signal()
+# El bot solo debe importar: route_signal()
 # =============================================================
 
 import os
@@ -17,6 +16,7 @@ import os
 # =============================================================
 # 1) Variable de entorno
 # =============================================================
+
 USE_MARGIN = os.getenv("USE_MARGIN", "false").lower() == "true"
 print(f"🔧 [Router] USE_MARGIN = {USE_MARGIN}")
 
@@ -35,7 +35,6 @@ except Exception as e:
     print(f"❌ [Router] Error importando Spot executor: {e}")
     SPOT_READY = False
 
-
 # ---------- MARGIN Executor ----------
 try:
     from utils.trade_executor_margin import (
@@ -47,7 +46,6 @@ except Exception as e:
     print(f"⚠️ [Router] Margin executor NO disponible aún: {e}")
     MARGIN_READY = False
 
-
 # =============================================================
 # 3) Router principal
 # =============================================================
@@ -58,7 +56,6 @@ def route_signal(signal: dict):
     - En BUY llama al buy correcto (spot/margin)
     - En SELL llama al sell correcto
     """
-
     side = signal.get("side", "").upper()
     symbol = signal.get("symbol")
 
@@ -73,7 +70,6 @@ def route_signal(signal: dict):
             print("⚠️ [Router] USE_MARGIN=True pero margin executor no está disponible → usando SPOT")
         else:
             print(f"🟣 [Router] Ejecutando vía MARGIN → {side} {symbol}")
-
             if side == "BUY":
                 return margin_buy(symbol)
             elif side == "SELL":
@@ -86,7 +82,6 @@ def route_signal(signal: dict):
         return {"status": "ERROR", "detail": "Spot executor no disponible"}
 
     print(f"🟢 [Router] Ejecutando vía SPOT → {side} {symbol}")
-
     if side == "BUY":
         return spot_buy(symbol)
     elif side == "SELL":
