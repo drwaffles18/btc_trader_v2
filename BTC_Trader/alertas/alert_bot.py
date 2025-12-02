@@ -1,16 +1,7 @@
-# alertas/alert_bot.py
-# Versión 5m + Momentum Físico "speed" por símbolo
-#
-# - Usa velas 5m
-# - Calcula Momentum Físico (mom, speed, accel, zscores)
-# - Genera Momentum Signal ('BUY'/'SELL')
-# - Usa limpiar_señales_consecutivas → 'Signal Final'
-# - Dispara alertas solo en transición de régimen
-# - Ejecuta trades vía route_signal (igual que antes)
-
 # ==========================================================
 # alertas/alert_bot.py
 # Versión 5m + Momentum Físico (BUY/SELL simples por ahora)
+# Soporta Spot o Margin vía USE_MARGIN
 # ==========================================================
 
 import os
@@ -28,7 +19,10 @@ from utils.binance_fetch import (
     bases_para,
 )
 from utils.risk_levels import build_levels, format_signal_msg
-from utils.trade_executor_v2 import route_signal       # ejecuta market buy/sell con pesos
+
+# ⬅️💥 AQUI EL CAMBIO CRÍTICO:
+from utils.trade_executor_router import route_signal  
+
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 
@@ -45,8 +39,13 @@ TRADE_LOG_PATH             = os.getenv("TRADE_LOG_PATH", "./trade_logs.csv")
 TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# 🔥 Opcional, solo para debugging
+USE_MARGIN = os.getenv("USE_MARGIN", "false").lower() == "true"
+print(f"🔧 USE_MARGIN = {USE_MARGIN}")
+
 GRACE_MINUTES = int(os.getenv("GRACE_MINUTES", "7"))
 HISTORY_LIMIT_5M = int(os.getenv("HISTORY_LIMIT_5M", "900"))
+
 
 SYMBOL_PARAMS = {
     "BTCUSDT": {"mom_win": 4, "speed_win": 9, "accel_win": 7, "zspeed_min": 0.3, "zaccel_min": 0.1},
@@ -149,9 +148,9 @@ def main():
             fila = exact.iloc[0]
             curr_clean = fila['Signal Final']
             price      = float(fila['Close'])
-            fecha_cr   = fila['Close time']    # ya en CR
+            fecha_cr   = fila['Close time']
 
-            # Señal previa (del clean)
+            # Señal previa limpia
             idx = df_clean.index.get_loc(fila.name)
             prev_clean = df_clean.iloc[idx - 1]['Signal Final'] if idx > 0 else None
 
@@ -166,11 +165,11 @@ def main():
 
             print(f"[{symbol}] ¿Debe enviar? {debe_enviar} | curr={curr_clean} | prev={prev_clean}")
 
-            if debe_enviar:
+            # --------------------------------------------------
+            #      EJECUCIÓN DE TRADE (SPOT o MARGIN)
+            # --------------------------------------------------
 
-                # --------------------------------------------------
-                # ⬇️⬇️⬇️   COMPORTAMIENTO TEMPORAL: MARKET ONLY   ⬇️⬇️⬇️
-                # --------------------------------------------------
+            if debe_enviar:
 
                 if signal == 'BUY':
                     mensaje = (
@@ -200,10 +199,6 @@ def main():
                     except Exception as e:
                         print(f"⚠️ Error SELL: {e}")
 
-                # --------------------------------------------------
-                # ⬆️⬆️⬆️   FUTURE: OCO TP/SL SE REHABILITA MAÑANA   ⬆️⬆️⬆️
-                # --------------------------------------------------
-
                 estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
 
             else:
@@ -211,7 +206,6 @@ def main():
 
         except Exception as e:
             print(f"❌ Error procesando {symbol}: {e}")
-
 
     print(f"💾 Guardando estado actual: {estado_actual}")
     guardar_estado_actual(estado_actual)
