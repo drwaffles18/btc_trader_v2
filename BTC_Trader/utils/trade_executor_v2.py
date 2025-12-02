@@ -5,6 +5,7 @@
 # - SELL → Market sell full balance
 # - Logs en CSV y Google Sheets
 # - FIX: MIN_NOTIONAL opcional (BTCUSDT no lo trae)
+# - NEW: Columna trade_mode = "spot" en Google Sheets
 # =============================================================
 
 import os
@@ -14,7 +15,6 @@ from decimal import Decimal, ROUND_DOWN
 import pandas as pd
 
 from utils.google_client import get_gsheet_client
-
 
 # -----------------------------
 # 0) CONFIGURACIÓN GENERAL
@@ -44,7 +44,6 @@ PORTFOLIO_WEIGHTS = {
 
 BINANCE_NOTIONAL_FLOOR = 5.0  # 🔥 mínimo real para market orders
 
-
 # -----------------------------
 # 1) INICIALIZACIÓN BINANCE
 # -----------------------------
@@ -70,7 +69,6 @@ else:
         }]).to_csv(LOG_FILE, mode="a", header=not os.path.exists(LOG_FILE), index=False)
         print("→ Continuando sin trading real.")
 
-
 # -----------------------------
 # 2) GOOGLE SHEETS (Trades)
 # -----------------------------
@@ -81,7 +79,21 @@ ws_trades = gs_client.open_by_key(GSHEET_ID).worksheet("Trades")
 
 
 def append_trade_row(ws, row_dict):
-    """Inserta fila nueva en la pestaña Trades."""
+    """
+    Inserta fila nueva en la pestaña Trades.
+    Formato esperado de columnas:
+    1) trade_id
+    2) symbol
+    3) side
+    4) qty
+    5) entry_price
+    6) entry_time
+    7) exit_price
+    8) exit_time
+    9) profit_usdt
+    10) status
+    11) trade_mode  ("spot" / "margin")
+    """
     row = [
         row_dict["trade_id"],
         row_dict["symbol"],
@@ -93,9 +105,9 @@ def append_trade_row(ws, row_dict):
         row_dict["exit_time"],
         row_dict["profit_usdt"],
         row_dict["status"],
+        row_dict.get("trade_mode", "spot"),  # 👈 NEW
     ]
     ws.append_row(row, value_input_option="RAW")
-
 
 # -----------------------------
 # 3) UTILITARIOS
@@ -169,7 +181,6 @@ def _get_spot_equity_usdt():
             pass
     return total
 
-
 # -----------------------------
 # 4) MARKET BUY
 # -----------------------------
@@ -194,7 +205,6 @@ def place_market_buy_by_quote(symbol, usdt_amount):
         type="MARKET",
         quoteOrderQty=str(usdt_clean)
     )
-
 
 # -----------------------------
 # 5) MARKET SELL
@@ -221,7 +231,6 @@ def sell_all_market(symbol):
         type="MARKET",
         quantity=str(qty_clean)
     )
-
 
 # -----------------------------
 # 6) BUY SIGNAL
@@ -294,7 +303,8 @@ def handle_buy_signal(symbol):
             "exit_price": "",
             "exit_time": "",
             "profit_usdt": "",
-            "status": "OPEN"
+            "status": "OPEN",
+            "trade_mode": "spot",   # 👈 NEW
         })
 
         return order
@@ -308,8 +318,6 @@ def handle_buy_signal(symbol):
             "message": str(e),
             "dry_run": DRY_RUN
         })
-
-
 
 # -----------------------------
 # 7) SELL SIGNAL
@@ -341,14 +349,16 @@ def handle_sell_signal(symbol):
         qty = float(last["qty"])
         profit = (sell_price - entry_price) * qty
 
-        # === UPDATE SEGURO (compatible con API) ===
+        # === UPDATE SEGURO (compatible con API)
+        # G: exit_price, H: exit_time, I: profit_usdt, J: status, K: trade_mode
         ws_trades.update(
-            f"G{row_idx}:J{row_idx}",
+            f"G{row_idx}:K{row_idx}",
             [[
                 sell_price,
                 datetime.utcnow().isoformat(),
                 profit,
-                "CLOSED"
+                "CLOSED",
+                "spot"   # 👈 NEW
             ]]
         )
 
@@ -374,9 +384,8 @@ def handle_sell_signal(symbol):
             "dry_run": DRY_RUN
         })
 
-
 # -----------------------------
-# 8) ROUTER
+# 8) ROUTER LOCAL (no se usa con el router global)
 # -----------------------------
 
 def route_signal(signal):
