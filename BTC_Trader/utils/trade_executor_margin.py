@@ -273,9 +273,27 @@ def _get_margin_free_asset(asset: str) -> float:
 # 3) BORROW / REPAY
 # =============================================================
 
+def _clean_amount_for_asset(asset: str, amount: float) -> float:
+    """
+    Limpia el número de decimales según el asset.
+    - USDT: máx 3 decimales (por seguridad en margin loan/repay).
+    - Otros: se deja igual.
+    """
+    if amount <= 0:
+        return 0.0
+
+    if asset.upper() == "USDT":
+        dec = Decimal(str(amount))
+        return float(dec.quantize(Decimal("0.001"), rounding=ROUND_DOWN))
+
+    return amount
+
+
 def borrow_if_needed(asset: str, notional_required_usdt: float):
     """
     Si no hay suficiente USDT libre en Margin, pide prestado la diferencia.
+    Aplica limpieza de decimales para evitar:
+      APIError(code=-1100): Illegal characters found in a parameter.
     """
     if not BINANCE_ENABLED:
         print("⚠️ borrow_if_needed: Margin no habilitado.")
@@ -284,18 +302,25 @@ def borrow_if_needed(asset: str, notional_required_usdt: float):
     free_usdt = _get_margin_free_usdt()
     missing = max(0.0, notional_required_usdt - free_usdt)
 
-    print(f"💳 borrow_if_needed → free USDT margin={free_usdt:.4f}, required={notional_required_usdt:.4f}, missing={missing:.4f}")
+    # 🔧 Fix: limpiar decimales de la cantidad a pedir prestada
+    missing_clean = _clean_amount_for_asset(asset, missing)
 
-    if missing <= 0:
+    print(
+        f"💳 borrow_if_needed → free USDT margin={free_usdt:.4f}, "
+        f"required={notional_required_usdt:.4f}, missing_raw={missing:.6f}, "
+        f"missing_clean={missing_clean:.6f}"
+    )
+
+    if missing_clean <= 0:
         print("ℹ️ No hace falta borrow, hay USDT suficiente en Margin.")
         return {"status": "NO_BORROW_NEEDED", "free_usdt": free_usdt}
 
     if DRY_RUN:
-        print(f"💤 DRY_RUN borrow {asset} amount={missing:.4f}")
-        return {"status": "DRY_RUN", "asset": asset, "amount": missing}
+        print(f"💤 DRY_RUN borrow {asset} amount={missing_clean:.4f}")
+        return {"status": "DRY_RUN", "asset": asset, "amount": missing_clean}
 
     try:
-        res = client.create_margin_loan(asset=asset, amount=str(missing))
+        res = client.create_margin_loan(asset=asset, amount=str(missing_clean))
         print(f"🟣 Borrow ejecutado: {res}")
         return res
     except Exception as e:
@@ -306,6 +331,7 @@ def borrow_if_needed(asset: str, notional_required_usdt: float):
 def _repay_all_usdt_debt():
     """
     Repaga toda la deuda USDT en Margin (borrow + intereses).
+    Aplica limpieza de decimales para evitar errores de parámetro.
     """
     if not BINANCE_ENABLED:
         print("⚠️ _repay_all_usdt_debt: Margin no habilitado.")
@@ -324,12 +350,18 @@ def _repay_all_usdt_debt():
         print("ℹ️ No hay deuda USDT que repagar.")
         return {"status": "NO_DEBT"}
 
+    debt_clean = _clean_amount_for_asset("USDT", debt)
+
+    if debt_clean <= 0:
+        print("ℹ️ Deuda limpiada <= 0, nada que repagar.")
+        return {"status": "NO_DEBT_CLEAN"}
+
     if DRY_RUN:
-        print(f"💤 DRY_RUN repay USDT debt={debt:.4f}")
-        return {"status": "DRY_RUN", "action": "REPAY", "asset": "USDT", "amount": debt}
+        print(f"💤 DRY_RUN repay USDT debt={debt_clean:.4f}")
+        return {"status": "DRY_RUN", "action": "REPAY", "asset": "USDT", "amount": debt_clean}
 
     try:
-        res = client.repay_margin_loan(asset="USDT", amount=str(debt))
+        res = client.repay_margin_loan(asset="USDT", amount=str(debt_clean))
         print(f"💰 Repay USDT ejecutado: {res}")
         return res
     except Exception as e:
@@ -464,7 +496,7 @@ def handle_margin_buy_signal(symbol: str):
         print(f"❌ Borrow ratio > 40%: {borrow_ratio:.4f}")
         return {"status": "risk_borrow_limit", "borrow_ratio": borrow_ratio}
 
-    # Borrow si hace falta
+    # Borrow si hace falta (con cantidad limpia)
     borrow_res = borrow_if_needed("USDT", usdt_notional_clean)
     if isinstance(borrow_res, dict) and borrow_res.get("status") in ("BORROW_FAILED", "DISABLED"):
         print(f"❌ ERROR en borrow USDT, abort BUY: {borrow_res}")
