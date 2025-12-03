@@ -1,25 +1,21 @@
 # =============================================================
-# 🟣 Binance Cross Margin Autotrader — Victor + GPT
+# 🟣 Binance Cross Margin Autotrader — Opción B (todo en Margin)
 # -------------------------------------------------------------
-# - Usa la misma API key que Spot (misma cuenta).
-# - Pensado para operar principalmente en Cross Margin:
-#       * Calcula equity base (margin si hay, si no spot).
-#       * Tamaño objetivo del trade = equity_base * weight * MARGIN_MULTIPLIER
-#       * Usa margin loan (borrow) automático si hace falta USDT.
-#       * Ejecuta BUY / SELL en Cross Margin (isIsolated = FALSE).
-# - Al cerrar:
-#       * Vende qty registrada.
-#       * Calcula profit.
-#       * Repaga TODA la deuda USDT en Margin.
-#       * NO transfiere de vuelta a Spot (tu API no tiene permiso).
-#
-# - Logging en Google Sheets:
-#       * Columna 11: trade_mode = "MARGIN"
-#
-# - Este módulo se usa solo si USE_MARGIN = true en el router.
-#   El router llama a:
-#       * handle_margin_buy_signal(symbol)
-#       * handle_margin_sell_signal(symbol)
+# - Todo el capital vive en Cross Margin.
+# - Spot solo se usa como "bolsa secundaria" si existiera algo ahí,
+#   pero el flujo normal es 100% Margin.
+# - Lógica:
+#       * Equity base = equity en Margin (totalAssetOfBtc * BTCUSDT)
+#       * trade_notional = equity_base * weight * MARGIN_MULTIPLIER
+#       * Si falta USDT libre en Margin → borrow USDT
+#       * BUY en Cross Margin (MARKET)
+#       * SELL:
+#           - Vende qty del trade
+#           - Calcula profit
+#           - Repaga toda la deuda USDT
+#           - NO transfiere nada a Spot
+#       * Sheets:
+#           - Columna 11 = trade_mode ("MARGIN")
 # =============================================================
 
 import os
@@ -31,7 +27,6 @@ import pandas as pd
 
 from utils.google_client import get_gsheet_client
 
-# Intentamos importar Cliente Binance
 try:
     from binance.client import Client
     from binance.enums import *
@@ -50,10 +45,9 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 # Multiplicador de tamaño vs equity base (ej. 3x)
 MARGIN_MULTIPLIER = float(os.getenv("MARGIN_MULTIPLIER", "3.0"))
 
-# Piso mínimo por trade en USDT
+# Mínimo por trade
 BINANCE_NOTIONAL_FLOOR = 5.0
 
-# Pesos por símbolo (mismo criterio que Spot)
 PORTFOLIO_WEIGHTS = {
     "BTCUSDT": 0.35,
     "ETHUSDT": 0.25,
@@ -78,7 +72,7 @@ else:
 
 
 # =============================================================
-# 1) GOOGLE SHEETS INIT
+# 1) GOOGLE SHEETS
 # =============================================================
 
 GSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -88,8 +82,8 @@ ws_trades = gs_client.open_by_key(GSHEET_ID).worksheet("Trades")
 
 def append_trade_row_margin(ws, row_dict):
     """
-    Inserta trade margin en la tabla general.
-    Estructura esperada de columnas:
+    Inserta trade margin en la tabla Trades.
+    Columnas esperadas:
     1) trade_id
     2) symbol
     3) side
@@ -122,8 +116,7 @@ def append_trade_row_margin(ws, row_dict):
 # 2) UTILS GENERALES
 # =============================================================
 
-def _round_step_size(value: float, step_size: float) -> float:
-    """Redondea qty al múltiplo permitido por LOT_SIZE."""
+def _round_step_size(value, step_size):
     if step_size == 0:
         return value
     dec_val = Decimal(str(value))
@@ -135,7 +128,7 @@ def _round_step_size(value: float, step_size: float) -> float:
     return float(rounded)
 
 
-def _get_symbol_filters(symbol: str):
+def _get_symbol_filters(symbol):
     """Obtiene LOT_SIZE, TICK_SIZE y MIN_NOTIONAL aproximado."""
     if not BINANCE_ENABLED:
         return {"step": 0.000001, "tick": 0.01, "min_notional": 5.0}
@@ -154,51 +147,16 @@ def _get_symbol_filters(symbol: str):
     }
 
 
-def _get_price(symbol: str) -> float:
+def _get_price(symbol):
     if not BINANCE_ENABLED:
         return 0.0
     t = client.get_symbol_ticker(symbol=symbol)
     return float(t["price"])
 
 
-# ---------------- Spot helpers ----------------
-
-def _get_spot_free_usdt() -> float:
-    """USDT libre en Spot."""
-    if not BINANCE_ENABLED:
-        return 1000.0
-    acc = client.get_account()
-    for b in acc["balances"]:
-        if b["asset"] == "USDT":
-            return float(b["free"])
-    return 0.0
-
-
-def _get_spot_equity_usdt() -> float:
-    """
-    Equity total en Spot en USDT (USDT + otros assets valorados en USDT).
-    Similar al spot executor.
-    """
-    if not BINANCE_ENABLED:
-        return 1000.0
-
-    acc = client.get_account()
-    balances = {b["asset"]: float(b["free"]) + float(b["locked"]) for b in acc["balances"]}
-
-    total = balances.get("USDT", 0.0)
-    for asset, qty in balances.items():
-        if asset in ("USDT", "BUSD", "FDUSD") or qty <= 0:
-            continue
-        symbol = f"{asset}USDT"
-        try:
-            price = _get_price(symbol)
-            total += qty * price
-        except Exception:
-            pass
-    return total
-
-
-# ---------------- Margin helpers ----------------
+# =============================================================
+# 3) HELPERS MARGIN
+# =============================================================
 
 def _get_margin_account():
     if not BINANCE_ENABLED:
@@ -206,34 +164,60 @@ def _get_margin_account():
     return client.get_margin_account()
 
 
-def _get_margin_equity_usdt() -> float:
+def _get_margin_equity_usdt():
     """
-    Equity total del margin account en USDT:
-    totalAssetOfBtc * precio BTCUSDT.
+    Equity total en Margin, en USDT:
+    totalAssetOfBtc * precio_BTCUSDT
+    """
+    if not BINANCE_ENABLED:
+        return 1000.0
+    acc = client.get_margin_account()
+    total_asset_btc = float(acc.get("totalAssetOfBtc", 0.0))
+    btc_price = _get_price("BTCUSDT") or 0.0
+    return total_asset_btc * btc_price
+
+
+def get_margin_level():
+    """
+    Margin Level = totalAssetOfBtc / totalLiabilityOfBtc
+    """
+    if not BINANCE_ENABLED:
+        return 99.0
+    acc = client.get_margin_account()
+    assets = float(acc.get("totalAssetOfBtc", 0.0))
+    liability = float(acc.get("totalLiabilityOfBtc", 0.0))
+    if liability <= 0:
+        return 99.0
+    return assets / liability
+
+
+def get_total_borrow_used_ratio():
+    """
+    borrow_used_ratio = totalLiabilityOfBtc / totalAssetOfBtc
     """
     if not BINANCE_ENABLED:
         return 0.0
     acc = client.get_margin_account()
-    total_btc = float(acc.get("totalAssetOfBtc", 0.0))
-    if total_btc <= 0:
-        return 0.0
-    btc_price = _get_price("BTCUSDT") or 0.0
-    return total_btc * btc_price
+    assets = float(acc.get("totalAssetOfBtc", 0.0))
+    liability = float(acc.get("totalLiabilityOfBtc", 0.0))
+    if assets <= 0:
+        return 1.0
+    return liability / assets
 
 
-def _get_margin_free_usdt() -> float:
-    """USDT libre en cuenta Margin (cross)."""
+def _get_margin_free_usdt():
+    """USDT libre en la cuenta Margin."""
     if not BINANCE_ENABLED:
         return 0.0
     acc = client.get_margin_account()
     for a in acc.get("userAssets", []):
         if a["asset"] == "USDT":
-            return float(a["free"])
+            return float(a.get("free", 0.0))
     return 0.0
 
 
-def _get_margin_debt_usdt() -> float:
-    """Deuda total de USDT en Margin = borrowed + interest."""
+def _get_margin_debt_usdt():
+    """Deuda de USDT en Margin (borrowed + interest)."""
     if not BINANCE_ENABLED:
         return 0.0
     acc = client.get_margin_account()
@@ -245,64 +229,23 @@ def _get_margin_debt_usdt() -> float:
     return 0.0
 
 
-def get_margin_level() -> float:
-    """Margin Level = totalAssetOfBtc / totalLiabilityOfBtc."""
-    if not BINANCE_ENABLED:
-        return 99.0
-
-    acc = client.get_margin_account()
-    assets = float(acc.get("totalAssetOfBtc", 0.0))
-    debts = float(acc.get("totalLiabilityOfBtc", 0.0))
-    if debts == 0:
-        return 99.0
-    return assets / debts
-
-
-def get_total_borrow_used_ratio() -> float:
+def borrow_if_needed(usdt_needed: float):
     """
-    Ratio de endeudamiento:
-    liability / asset (en BTC).
+    Pide prestado USDT si usdt_needed > 0.
     """
-    if not BINANCE_ENABLED:
-        return 0.0
-
-    acc = client.get_margin_account()
-    liability = float(acc.get("totalLiabilityOfBtc", 0.0))
-    asset = float(acc.get("totalAssetOfBtc", 0.0))
-    if asset <= 0:
-        return 1.0  # riesgo máximo
-    return liability / asset
-
-
-def borrow_if_needed(asset: str, amount_needed: float):
-    """
-    Pide prestado 'asset' si el free en Margin es menor a amount_needed.
-    Solo pedimos lo que falta.
-    """
-    if amount_needed <= 0:
-        print("ℹ️ borrow_if_needed: amount_needed <= 0, no se pide préstamo.")
+    if usdt_needed <= 0:
         return {"status": "NO_BORROW"}
 
     if DRY_RUN or not BINANCE_ENABLED:
-        print(f"💤 DRY_RUN borrow {asset} por {amount_needed:.6f}")
-        return {"status": "DRY_RUN", "asset": asset, "amount": amount_needed}
-
-    # Free actual en Margin
-    free_margin = 0.0
-    if asset == "USDT":
-        free_margin = _get_margin_free_usdt()
-
-    missing = amount_needed - free_margin
-    if missing <= 0:
-        print(f"ℹ️ No se requiere borrow. free_margin={free_margin:.6f} ≥ needed={amount_needed:.6f}")
-        return {"status": "NO_BORROW", "free_margin": free_margin}
+        print(f"💤 DRY_RUN borrow USDT por {usdt_needed:.4f}")
+        return {"status": "DRY_RUN", "asset": "USDT", "amount": usdt_needed}
 
     try:
-        res = client.create_margin_loan(asset=asset, amount=str(missing))
-        print(f"🟣 Borrow ejecutado: {asset} {missing:.6f} → {res}")
+        res = client.create_margin_loan(asset="USDT", amount=str(usdt_needed))
+        print(f"🟣 Borrow ejecutado USDT {usdt_needed:.4f}: {res}")
         return res
     except Exception as e:
-        print(f"❌ ERROR borrow {asset}: {e}")
+        print(f"❌ ERROR borrow USDT: {e}")
         return {"error": str(e)}
 
 
@@ -314,25 +257,24 @@ def _repay_all_usdt_debt():
         return {"status": "NO_DEBT"}
 
     if DRY_RUN or not BINANCE_ENABLED:
-        print(f"💤 DRY_RUN repay USDT debt {debt:.6f}")
-        return {"status": "DRY_RUN", "action": "REPAY", "asset": "USDT", "amount": debt}
+        print(f"💤 DRY_RUN repay USDT {debt:.4f}")
+        return {"status": "DRY_RUN", "asset": "USDT", "amount": debt}
 
     try:
-        # En python-binance la función es repay_margin_loan
         res = client.repay_margin_loan(asset="USDT", amount=str(debt))
         print(f"💰 Repay USDT debt ejecutado: {res}")
         return res
     except Exception as e:
-        print(f"❌ ERROR repaying USDT debt: {e}")
+        print(f"❌ ERROR repaying USDT: {e}")
         return {"error": str(e)}
 
 
 # =============================================================
-# 3) MARGIN MARKET BUY / SELL
+# 4) ORDERS MARGIN
 # =============================================================
 
 def place_margin_buy(symbol: str, usdt_amount: float):
-    """Ejecuta un market BUY en Cross Margin con quoteOrderQty."""
+    """Market BUY en Cross Margin usando quoteOrderQty."""
     if DRY_RUN or not BINANCE_ENABLED:
         price = _get_price(symbol)
         qty = usdt_amount / price if price > 0 else 0.0
@@ -361,7 +303,7 @@ def place_margin_buy(symbol: str, usdt_amount: float):
 
 
 def place_margin_sell(symbol: str, qty: float):
-    """Ejecuta un market SELL en Cross Margin."""
+    """Market SELL en Cross Margin."""
     if DRY_RUN or not BINANCE_ENABLED:
         price = _get_price(symbol)
         print(f"💤 DRY_RUN margin SELL {symbol} qty={qty:.6f} price≈{price}")
@@ -389,145 +331,113 @@ def place_margin_sell(symbol: str, qty: float):
 
 
 # =============================================================
-# 4) MANEJO DE BUY SIGNAL (MARGIN)
+# 5) HANDLE BUY SIGNAL (Opción B)
 # =============================================================
 
 def handle_margin_buy_signal(symbol: str):
-    """
-    BUY en Cross Margin:
-    - Usa equity de Margin si existe, si no equity Spot.
-    - Tamaño objetivo = equity_base * weight * MARGIN_MULTIPLIER.
-    - Aplica controles de riesgo (margin level, borrow_ratio).
-    - Usa borrow_if_needed("USDT", notional) antes del BUY.
-    - Registra el trade en Sheets con trade_mode = "MARGIN".
-    """
     print(f"\n========== 🟣 MARGIN BUY {symbol} ==========")
 
-    if not BINANCE_ENABLED:
-        print("⚠️ Margin no habilitado (no API keys).")
-        return {"status": "DISABLED"}
-
-    # 1. Equity base
+    # 1. Equity en Margin como base
     margin_equity = _get_margin_equity_usdt()
-    spot_equity = _get_spot_equity_usdt()
-    free_spot_usdt = _get_spot_free_usdt()
-
-    equity_base = margin_equity if margin_equity > 0 else spot_equity
-
-    print(f"ℹ️ Margin equity ≈ {margin_equity:.2f} USDT | Spot equity ≈ {spot_equity:.2f} USDT | free Spot USDT ≈ {free_spot_usdt:.2f}")
-    print(f"ℹ️ Usando equity_base ≈ {equity_base:.2f} USDT")
-
+    free_margin_usdt = _get_margin_free_usdt()
     weight = PORTFOLIO_WEIGHTS.get(symbol, 0.0)
-    if weight <= 0:
-        print(f"⚠️ weight=0 para {symbol}, se ignora BUY.")
-        return {"status": "NO_WEIGHT"}
 
-    base_target = equity_base * weight
+    base_target = margin_equity * weight
     trade_notional_raw = base_target * MARGIN_MULTIPLIER
 
+    print(f"ℹ️ Margin equity ≈ {margin_equity:.2f} USDT | free Margin USDT ≈ {free_margin_usdt:.2f}")
     print(f"🧮 {symbol}: base_target ≈ {base_target:.2f} → trade_notional_raw ≈ {trade_notional_raw:.2f}")
 
-    # 2. Filtros del símbolo y pisos mínimos
-    f = _get_symbol_filters(symbol)
-    tick = Decimal(str(f["tick"]))
-    min_notional_filter = f["min_notional"]
-    min_required = max(BINANCE_NOTIONAL_FLOOR, min_notional_filter)
-
-    if trade_notional_raw < min_required:
-        print(f"❌ Trade demasiado pequeño: {trade_notional_raw:.2f} < min_required={min_required:.2f}")
+    if trade_notional_raw < BINANCE_NOTIONAL_FLOOR:
+        print(f"❌ Trade demasiado pequeño: {trade_notional_raw:.2f} < {BINANCE_NOTIONAL_FLOOR}")
         return {"status": "too_small"}
 
-    # 🔧 Ajuste de precisión de notional
-    trade_notional = float((Decimal(str(trade_notional_raw)) // tick) * tick)
-    print(f"🔧 Notional limpio (tick) ≈ {trade_notional:.4f} USDT (min_required={min_required:.2f})")
-
-    if trade_notional < min_required:
-        print(f"❌ Notional limpio < min_required después de ajustar tick.")
-        return {"status": "too_small_clean"}
-
-    # 3. Controles de riesgo en Margin
+    # 2. Controles de riesgo
     mlevel = get_margin_level()
     if mlevel < 2.0:
         print(f"❌ MarginLevel peligroso: {mlevel}")
-        return {"status": "risk_margin_level", "margin_level": mlevel}
+        return {"status": "risk_margin_level"}
 
     borrow_ratio = get_total_borrow_used_ratio()
     if borrow_ratio > 0.40:
-        print(f"❌ Borrow ratio > 40%: {borrow_ratio}")
-        return {"status": "risk_borrow_limit", "borrow_ratio": borrow_ratio}
+        print(f"❌ Borrow ratio > 40%: {borrow_ratio:.4f}")
+        return {"status": "risk_borrow_limit"}
 
-    # 4. Pedir préstamo si hace falta
-    borrow_res = borrow_if_needed("USDT", trade_notional)
-    if isinstance(borrow_res, dict) and "error" in borrow_res:
-        print(f"❌ ERROR en borrow USDT, abort BUY: {borrow_res['error']}")
-        return {"status": "borrow_failed", "detail": borrow_res["error"]}
+    # 3. Normalizar notional a tick
+    f = _get_symbol_filters(symbol)
+    tick = Decimal(str(f["tick"]))
 
-    # 5. Ejecutar BUY en Margin
-    res = place_margin_buy(symbol, trade_notional)
+    trade_notional_clean = float((Decimal(str(trade_notional_raw)) // tick) * tick)
+    min_required = max(f["min_notional"], BINANCE_NOTIONAL_FLOOR)
+
+    print(f"🔧 Notional limpio (tick) ≈ {trade_notional_clean:.4f} USDT (min_required={min_required:.2f})")
+
+    if trade_notional_clean < min_required:
+        print(f"❌ Notional limpio < mín requerido.")
+        return {"status": "below_min_notional"}
+
+    # 4. Borrow si hace falta
+    borrow_needed = max(0.0, trade_notional_clean - free_margin_usdt)
+    print(f"→ free_margin_usdt ≈ {free_margin_usdt:.4f} | borrow_needed ≈ {borrow_needed:.4f}")
+
+    if borrow_needed > 0:
+        borrow_res = borrow_if_needed(borrow_needed)
+        if "error" in borrow_res:
+            print(f"❌ ERROR en borrow USDT, abort BUY: {borrow_res['error']}")
+            return {"status": "borrow_failed", "detail": borrow_res["error"]}
+
+    # 5. Ejecutar BUY Margin
+    res = place_margin_buy(symbol, trade_notional_clean)
     if "error" in res:
         print(f"❌ Margin BUY falló: {res['error']}")
         return res
 
     executed_qty = float(res.get("executedQty", 0.0))
-    quote_spent = float(res.get("cummulativeQuoteQty", trade_notional))
-
-    if executed_qty > 0 and quote_spent > 0:
-        entry_price = quote_spent / executed_qty
+    quote_used = float(res.get("cummulativeQuoteQty", trade_notional_clean))
+    if executed_qty > 0 and quote_used > 0:
+        entry_price = quote_used / executed_qty
     else:
         entry_price = _get_price(symbol)
 
-    qty = executed_qty
-
     trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
 
-    # 6. Registrar trade en Sheets
     append_trade_row_margin(ws_trades, {
         "trade_id": trade_id,
         "symbol": symbol,
         "side": "BUY",
-        "qty": qty,
+        "qty": executed_qty,
         "entry_price": entry_price,
         "entry_time": datetime.utcnow().isoformat(),
         "exit_price": "",
         "exit_time": "",
         "profit_usdt": "",
         "status": "OPEN",
-        "trade_mode": "MARGIN",
+        "trade_mode": "MARGIN"
     })
 
-    print(f"🟣 Margin BUY completado: qty≈{qty:.6f} entry≈{entry_price:.4f}")
+    print("🟣 Margin BUY completado.")
     return res
 
 
 # =============================================================
-# 5) MANEJO DE SELL SIGNAL (MARGIN)
+# 6) HANDLE SELL SIGNAL (Opción B)
 # =============================================================
 
 def handle_margin_sell_signal(symbol: str):
-    """
-    SELL en Cross Margin:
-    - Busca el último trade OPEN en Sheets para ese símbolo, preferiblemente MARGIN.
-    - Vende la cantidad registrada (qty) en Margin.
-    - Calcula profit.
-    - Repaga deuda USDT (toda).
-    - No transfiere de vuelta a Spot.
-    - Actualiza fila en Sheets.
-    """
     print(f"\n========== 🔴 MARGIN SELL {symbol} ==========")
 
     if not BINANCE_ENABLED:
         print("⚠️ Margin no habilitado (no API keys).")
         return {"status": "DISABLED"}
 
-    # 1. Buscar trade abierto en Sheets
+    # 1. Buscar trade abierto para este símbolo
     trades = ws_trades.get_all_records()
-    open_trades = [t for t in trades if t.get("symbol") == symbol and t.get("status") == "OPEN"]
+    open_trades = [t for t in trades if t["symbol"] == symbol and t["status"] == "OPEN"]
 
     if not open_trades:
         print("⚠️ No hay trades OPEN para cerrar en Sheets.")
         return {"status": "NO_OPEN_TRADES"}
 
-    # Preferimos el último con trade_mode = "MARGIN", si existe
     margin_trades = [t for t in open_trades if str(t.get("trade_mode", "")).upper() == "MARGIN"]
     if margin_trades:
         last = margin_trades[-1]
@@ -536,29 +446,29 @@ def handle_margin_sell_signal(symbol: str):
 
     qty = float(last["qty"])
     entry_price = float(last["entry_price"])
-    row_idx = trades.index(last) + 2  # header + index base 1
+    row_idx = trades.index(last) + 2  # header + índice base 1
 
     if qty <= 0:
         print("⚠️ Qty del trade <= 0, abort SELL.")
         return {"status": "INVALID_QTY"}
 
-    # 2. Ajustar qty según LOT_SIZE en Margin
-    filters = _get_symbol_filters(symbol)
-    qty_clean = _round_step_size(qty, filters["step"])
+    # 2. Ajustar qty por LOT_SIZE
+    f = _get_symbol_filters(symbol)
+    qty_clean = _round_step_size(qty, f["step"])
 
     if qty_clean <= 0:
         print("⚠️ Qty limpia <= 0 después de LOT_SIZE, abort SELL.")
         return {"status": "INVALID_QTY_CLEAN"}
 
-    # 3. Ejecutar SELL en Margin
+    # 3. Ejecutar SELL Margin
     sell_res = place_margin_sell(symbol, qty_clean)
     if "error" in sell_res:
         print("❌ Margin SELL falló, no se actualiza Sheets.")
         return sell_res
 
-    # Precio efectivo de venta
     executed_qty = float(sell_res.get("executedQty", qty_clean))
     quote_got = float(sell_res.get("cummulativeQuoteQty", 0.0))
+
     if executed_qty > 0 and quote_got > 0:
         sell_price = quote_got / executed_qty
     else:
@@ -566,10 +476,10 @@ def handle_margin_sell_signal(symbol: str):
 
     profit = (sell_price - entry_price) * qty_clean
 
-    # 4. Repagar deuda de USDT
+    # 4. Repagar deuda USDT
     _repay_all_usdt_debt()
 
-    # 5. Actualizar en Sheets
+    # 5. Actualizar Sheets
     ws_trades.update(
         f"G{row_idx}:J{row_idx}",
         [[
