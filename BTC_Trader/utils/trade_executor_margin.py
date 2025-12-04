@@ -231,10 +231,6 @@ def get_total_borrow_used_ratio():
 # =============================================================
 
 def borrow_if_needed(asset, required_usdt):
-    """
-    Realiza borrow si free_margin_usdt < required_usdt.
-    Incluye logs de debug.
-    """
     free = _get_margin_free_usdt()
     missing_raw = required_usdt - free
     missing_clean = max(0.0, missing_raw)
@@ -245,8 +241,13 @@ def borrow_if_needed(asset, required_usdt):
     if missing_clean <= 0:
         return {"status": "NO_BORROW_NEEDED", "free": free}
 
+    # 🔧 FIX: limitar precisión a 6 decimales
+    missing_clean = float(
+        Decimal(str(missing_clean)).quantize(Decimal("1.000000"), rounding=ROUND_DOWN)
+    )
+    print(f"🔧 borrow amount ajustado={missing_clean}")
+
     if DRY_RUN:
-        print(f"💤 DRY_RUN borrow {asset} {missing_clean}")
         return {"status": "DRY_RUN", "amount": missing_clean}
 
     try:
@@ -256,6 +257,7 @@ def borrow_if_needed(asset, required_usdt):
     except Exception as e:
         print(f"❌ ERROR borrow {asset}: {e}")
         return {"status": "BORROW_FAILED", "error": str(e)}
+
 
 
 def _repay_all_usdt_debt():
@@ -285,12 +287,13 @@ def _repay_all_usdt_debt():
         return {"status": "DRY_RUN", "debt": debt}
 
     try:
-        res = client.repay_margin_loan(asset="USTO", amount=str(debt))
+        res = client.repay_margin_loan(asset="USDT", amount=str(debt))  # 👈 aquí el fix
         print(f"💰 Repay ejecutado: {res}")
         return res
     except Exception as e:
         print(f"❌ ERROR repay: {e}")
         return {"status": "REPAY_FAILED", "error": str(e)}
+
 
 
 # =============================================================
