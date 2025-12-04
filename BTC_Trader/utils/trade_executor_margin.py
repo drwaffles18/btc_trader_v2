@@ -1,13 +1,14 @@
 # =============================================================
-# 🟣 Binance Cross Margin Autotrader V4 — Victor + GPT (PATCHED)
+# 🟣 Binance Cross Margin Autotrader V5 — Victor + GPT
 # -------------------------------------------------------------
 #  ✔ Usa cuenta Cross Margin como principal (Opción B)
 #  ✔ No transfiere nada Spot ↔ Margin
 #  ✔ Usa borrow cuando falta USDT (con decimales limpios)
 #  ✔ BUY calcula notional según portafolio × 3x
-#  ✔ Safe Notional IRONCLAD (evita errores 1100/2010)
+#  ✔ Ajusta el notional al máximo posible después del borrow
+#  ✔ Si el BUY falla, repaga solo lo prestado en ese intento
 #  ✔ SELL liquida el 100% de lo que haya realmente en Margin
-#  ✔ Repaga deuda automáticamente (monto truncado a 2 decimales)
+#  ✔ Repaga deuda automáticamente al vender
 #  ✔ Registro de Trades en Google Sheets con trade_mode = "MARGIN"
 #  ✔ Debug extendido pero liviano
 #
@@ -222,32 +223,30 @@ def get_total_borrow_used_ratio():
 
 
 # =============================================================
-# 3) BORROW / REPAY (PATCHED DECIMALES)
+# 3) BORROW / REPAY
 # =============================================================
 
 def borrow_if_needed(asset, required_usdt):
     """
     Realiza borrow si free_margin_usdt < required_usdt.
     Usa Decimal y trunca a 2 decimales para evitar errores -1100.
-    Incluye logs de debug.
+    Devuelve cuánto se pidió prestado.
     """
     if not BINANCE_ENABLED:
-        return {"status": "DISABLED"}
+        return {"status": "DISABLED", "borrowed": 0.0}
 
     free = _get_margin_free_usdt()
 
-    # Usar Decimal para evitar problemas de representación y exceso de decimales
     required_dec = Decimal(str(required_usdt))
     free_dec = Decimal(str(free))
     missing_dec = required_dec - free_dec
 
-    # No permitir negativos
     if missing_dec <= Decimal("0"):
         print(
             f"💳 borrow_if_needed → free={free:.6f}, "
-            f"required={required_usdt:.6f}, missing_raw={float(missing_dec):.6f}, missing_clean=0.000000"
+            f"required={required_usdt:.6f}, missing_raw={float(missing_dec):.6f}, borrow_amount=0.00"
         )
-        return {"status": "NO_BORROW_NEEDED", "free": free}
+        return {"status": "NO_BORROW_NEEDED", "borrowed": 0.0, "free_before": free}
 
     # Truncar a 2 decimales (ej: 33.662875 → 33.66)
     amount_dec = missing_dec.quantize(Decimal("1.00"), rounding=ROUND_DOWN)
@@ -257,7 +256,7 @@ def borrow_if_needed(asset, required_usdt):
             f"💳 borrow_if_needed → free={free:.6f}, "
             f"required={required_usdt:.6f}, missing_raw={float(missing_dec):.6f}, amount_dec<=0 tras truncar"
         )
-        return {"status": "NO_BORROW_NEEDED_POST_TRUNC", "free": free}
+        return {"status": "NO_BORROW_NEEDED_POST_TRUNC", "borrowed": 0.0, "free_before": free}
 
     amount_str = str(amount_dec)
 
@@ -268,15 +267,15 @@ def borrow_if_needed(asset, required_usdt):
 
     if DRY_RUN:
         print(f"💤 DRY_RUN borrow {asset} {amount_str}")
-        return {"status": "DRY_RUN", "amount": float(amount_dec)}
+        return {"status": "DRY_RUN", "borrowed": float(amount_dec), "free_before": free}
 
     try:
         res = client.create_margin_loan(asset=asset, amount=amount_str)
         print(f"🟣 Borrow ejecutado correctamente: {res}")
-        return res
+        return {"status": "BORROW_OK", "borrowed": float(amount_dec), "free_before": free, "raw": res}
     except Exception as e:
         print(f"❌ ERROR borrow {asset}: {e}")
-        return {"status": "BORROW_FAILED", "error": str(e)}
+        return {"status": "BORROW_FAILED", "error": str(e), "borrowed": 0.0, "free_before": free}
 
 
 def _repay_all_usdt_debt():
@@ -301,7 +300,6 @@ def _repay_all_usdt_debt():
         print("ℹ️ No hay deuda que repagar.")
         return {"status": "NO_DEBT"}
 
-    # Truncar deuda a 2 decimales
     debt_dec = Decimal(str(debt)).quantize(Decimal("1.00"), rounding=ROUND_DOWN)
     if debt_dec <= Decimal("0"):
         print(f"ℹ️ Deuda muy pequeña tras truncar: {debt_dec}")
@@ -319,6 +317,51 @@ def _repay_all_usdt_debt():
         return res
     except Exception as e:
         print(f"❌ ERROR repay: {e}")
+        return {"status": "REPAY_FAILED", "error": str(e)}
+
+
+def _repay_usdt_amount(amount):
+    """
+    Repaga una cantidad específica de deuda USDT (parcial).
+    Trunca a 2 decimales y se asegura de no exceder la deuda real.
+    """
+    if not BINANCE_ENABLED:
+        return {"status": "DISABLED"}
+
+    if amount <= 0:
+        return {"status": "NO_AMOUNT"}
+
+    acc = client.get_margin_account()
+    borrowed = interest = 0.0
+    for a in acc["userAssets"]:
+        if a["asset"] == "USDT":
+            borrowed = float(a.get("borrowed", 0))
+            interest = float(a.get("interest", 0))
+            break
+
+    debt = borrowed + interest
+    if debt <= 0:
+        print("ℹ️ No hay deuda que repagar (parcial).")
+        return {"status": "NO_DEBT"}
+
+    repay_raw = min(debt, amount)
+    repay_dec = Decimal(str(repay_raw)).quantize(Decimal("1.00"), rounding=ROUND_DOWN)
+    if repay_dec <= Decimal("0"):
+        print(f"ℹ️ Deuda parcial muy pequeña tras truncar: {repay_dec}")
+        return {"status": "NO_DEBT_TRUNC"}
+
+    repay_str = str(repay_dec)
+    print(f"💰 Repagando deuda parcial USDT: {repay_str}")
+
+    if DRY_RUN:
+        return {"status": "DRY_RUN", "debt": float(repay_dec)}
+
+    try:
+        res = client.repay_margin_loan(asset="USDT", amount=repay_str)
+        print(f"💰 Repay parcial ejecutado: {res}")
+        return res
+    except Exception as e:
+        print(f"❌ ERROR repay parcial: {e}")
         return {"status": "REPAY_FAILED", "error": str(e)}
 
 
@@ -379,7 +422,7 @@ def place_margin_sell(symbol, qty):
 
 
 # =============================================================
-# 5) HANDLE BUY SIGNAL — *IRONCLAD VERSION*
+# 5) HANDLE BUY SIGNAL — *IRONCLAD V5*
 # =============================================================
 
 def handle_margin_buy_signal(symbol):
@@ -421,7 +464,6 @@ def handle_margin_buy_signal(symbol):
     # Safe Notional IRONCLAD
     safe_notional = clean_notional * 0.9995
     safe_notional = float((Decimal(str(safe_notional)) // tick) * tick)
-
     print(f"🧱 SAFE notional={safe_notional:.6f}")
 
     if safe_notional < min_notional:
@@ -439,20 +481,44 @@ def handle_margin_buy_signal(symbol):
         print(f"❌ Borrow usage alto: {borrow_ratio}")
         return {"status": "risk_borrow_limit"}
 
-    # Borrow si hace falta (PATCHED)
+    # ---------------------------------------------------------
+    # Borrow si hace falta
+    # ---------------------------------------------------------
     borrow_res = borrow_if_needed("USDT", safe_notional)
     if borrow_res.get("status") == "BORROW_FAILED":
         print("❌ Abort BUY por error en borrow")
         return {"status": "borrow_failed", "detail": borrow_res}
 
-    # Ejecutar BUY
-    res = place_margin_buy(symbol, safe_notional)
+    borrowed_amount = float(borrow_res.get("borrowed", 0.0))
+
+    # Releer free USDT tras el borrow, como si el usuario mirara su balance
+    free_after = _get_margin_free_usdt()
+    print(f"💵 USDT libre tras borrow (antes de BUY): {free_after:.6f}")
+
+    # Ajustar notional al máximo posible con los fondos realmente disponibles
+    effective_notional = min(safe_notional, free_after)
+    effective_notional = float((Decimal(str(effective_notional)) // tick) * tick)
+    print(f"🧮 effective_notional={effective_notional:.6f} (ajustado a fondos reales)")
+
+    if effective_notional < min_notional:
+        print("❌ effective_notional < min_notional después de borrow.")
+        if borrowed_amount > 0:
+            print("🔁 Repagando borrow porque no se puede ejecutar un trade válido.")
+            _repay_usdt_amount(borrowed_amount)
+        return {"status": "too_small_after_borrow", "borrowed": borrowed_amount}
+
+    # Ejecutar BUY con el notional ajustado
+    res = place_margin_buy(symbol, effective_notional)
     if "error" in res:
         print("❌ BUY falló")
-        return res
+        # Si falló el BUY y se había hecho borrow, repagamos ese monto
+        if borrowed_amount > 0:
+            print("🔁 Repagando borrow porque el BUY falló.")
+            _repay_usdt_amount(borrowed_amount)
+        return {"status": "buy_failed", "detail": res, "borrowed": borrowed_amount}
 
     qty = float(res.get("executedQty", 0))
-    quote = float(res.get("cummulativeQuoteQty", safe_notional))
+    quote = float(res.get("cummulativeQuoteQty", effective_notional))
     entry_price = quote / qty if qty > 0 else _get_price(symbol)
 
     trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
@@ -528,7 +594,7 @@ def handle_margin_sell_signal(symbol):
 
     profit = (sell_price - entry_price) * executed
 
-    # Repagar deuda
+    # Repagar toda la deuda restante (modo Opción B)
     _repay_all_usdt_debt()
 
     free_usdt = _get_margin_free_usdt()
