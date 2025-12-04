@@ -1,13 +1,13 @@
 # =============================================================
-# 🟣 Binance Cross Margin Autotrader V4 — Victor + GPT
+# 🟣 Binance Cross Margin Autotrader V4 — Victor + GPT (PATCHED)
 # -------------------------------------------------------------
 #  ✔ Usa cuenta Cross Margin como principal (Opción B)
 #  ✔ No transfiere nada Spot ↔ Margin
-#  ✔ Usa borrow cuando falta USDT
+#  ✔ Usa borrow cuando falta USDT (con decimales limpios)
 #  ✔ BUY calcula notional según portafolio × 3x
 #  ✔ Safe Notional IRONCLAD (evita errores 1100/2010)
 #  ✔ SELL liquida el 100% de lo que haya realmente en Margin
-#  ✔ Repaga deuda automáticamente
+#  ✔ Repaga deuda automáticamente (monto truncado a 2 decimales)
 #  ✔ Registro de Trades en Google Sheets con trade_mode = "MARGIN"
 #  ✔ Debug extendido pero liviano
 #
@@ -222,30 +222,56 @@ def get_total_borrow_used_ratio():
 
 
 # =============================================================
-# 3) BORROW / REPAY
+# 3) BORROW / REPAY (PATCHED DECIMALES)
 # =============================================================
 
 def borrow_if_needed(asset, required_usdt):
     """
     Realiza borrow si free_margin_usdt < required_usdt.
+    Usa Decimal y trunca a 2 decimales para evitar errores -1100.
     Incluye logs de debug.
     """
+    if not BINANCE_ENABLED:
+        return {"status": "DISABLED"}
+
     free = _get_margin_free_usdt()
-    missing_raw = required_usdt - free
-    missing_clean = max(0.0, missing_raw)
 
-    print(f"💳 borrow_if_needed → free={free:.6f}, required={required_usdt:.6f}, "
-          f"missing_raw={missing_raw:.6f}, missing_clean={missing_clean:.6f}")
+    # Usar Decimal para evitar problemas de representación y exceso de decimales
+    required_dec = Decimal(str(required_usdt))
+    free_dec = Decimal(str(free))
+    missing_dec = required_dec - free_dec
 
-    if missing_clean <= 0:
+    # No permitir negativos
+    if missing_dec <= Decimal("0"):
+        print(
+            f"💳 borrow_if_needed → free={free:.6f}, "
+            f"required={required_usdt:.6f}, missing_raw={float(missing_dec):.6f}, missing_clean=0.000000"
+        )
         return {"status": "NO_BORROW_NEEDED", "free": free}
 
+    # Truncar a 2 decimales (ej: 33.662875 → 33.66)
+    amount_dec = missing_dec.quantize(Decimal("1.00"), rounding=ROUND_DOWN)
+
+    if amount_dec <= Decimal("0"):
+        print(
+            f"💳 borrow_if_needed → free={free:.6f}, "
+            f"required={required_usdt:.6f}, missing_raw={float(missing_dec):.6f}, amount_dec<=0 tras truncar"
+        )
+        return {"status": "NO_BORROW_NEEDED_POST_TRUNC", "free": free}
+
+    amount_str = str(amount_dec)
+
+    print(
+        f"💳 borrow_if_needed → free={free:.6f}, required={required_usdt:.6f}, "
+        f"missing_raw={float(missing_dec):.6f}, borrow_amount={amount_str}"
+    )
+
     if DRY_RUN:
-        print(f"💤 DRY_RUN borrow {asset} {missing_clean}")
-        return {"status": "DRY_RUN", "amount": missing_clean}
+        print(f"💤 DRY_RUN borrow {asset} {amount_str}")
+        return {"status": "DRY_RUN", "amount": float(amount_dec)}
 
     try:
-        res = client.create_margin_loan(asset=asset, amount=str(missing_clean))
+        res = client.create_margin_loan(asset=asset, amount=amount_str)
         print(f"🟣 Borrow ejecutado correctamente: {res}")
         return res
     except Exception as e:
@@ -256,6 +282,7 @@ def borrow_if_needed(asset, required_usdt):
 def _repay_all_usdt_debt():
     """
     Repaga toda la deuda de USDT.
+    Monto truncado a 2 decimales para evitar errores de formato.
     """
     if not BINANCE_ENABLED:
         return {"status": "DISABLED"}
@@ -274,13 +301,20 @@ def _repay_all_usdt_debt():
         print("ℹ️ No hay deuda que repagar.")
         return {"status": "NO_DEBT"}
 
-    print(f"💰 Repagando deuda total USDT: {debt:.6f}")
+    # Truncar deuda a 2 decimales
+    debt_dec = Decimal(str(debt)).quantize(Decimal("1.00"), rounding=ROUND_DOWN)
+    if debt_dec <= Decimal("0"):
+        print(f"ℹ️ Deuda muy pequeña tras truncar: {debt_dec}")
+        return {"status": "NO_DEBT_TRUNC"}
+
+    debt_str = str(debt_dec)
+    print(f"💰 Repagando deuda total USDT: {debt_str}")
 
     if DRY_RUN:
-        return {"status": "DRY_RUN", "debt": debt}
+        return {"status": "DRY_RUN", "debt": float(debt_dec)}
 
     try:
-        res = client.repay_margin_loan(asset="USDT", amount=str(debt))
+        res = client.repay_margin_loan(asset="USDT", amount=debt_str)
         print(f"💰 Repay ejecutado: {res}")
         return res
     except Exception as e:
@@ -300,7 +334,7 @@ def place_margin_buy(symbol, notional):
 
     if DRY_RUN or not BINANCE_ENABLED:
         price = _get_price(symbol)
-        qty = notional / price
+        qty = notional / price if price > 0 else 0.0
         print(f"💤 DRY_RUN BUY qty≈{qty:.6f}")
         return {"executedQty": qty, "cummulativeQuoteQty": notional, "price": price}
 
@@ -405,7 +439,7 @@ def handle_margin_buy_signal(symbol):
         print(f"❌ Borrow usage alto: {borrow_ratio}")
         return {"status": "risk_borrow_limit"}
 
-    # Borrow si hace falta
+    # Borrow si hace falta (PATCHED)
     borrow_res = borrow_if_needed("USDT", safe_notional)
     if borrow_res.get("status") == "BORROW_FAILED":
         print("❌ Abort BUY por error en borrow")
