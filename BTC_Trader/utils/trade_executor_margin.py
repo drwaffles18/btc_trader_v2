@@ -1,5 +1,5 @@
 # =============================================================
-# 🟣 Binance Cross Margin Autotrader V5 — Victor + GPT
+# 🟣 Binance Cross Margin Autotrader V5.5 — Victor + GPT
 # -------------------------------------------------------------
 #  ✔ Usa cuenta Cross Margin como principal (Opción B)
 #  ✔ No transfiere nada Spot ↔ Margin
@@ -10,6 +10,7 @@
 #  ✔ Repaga deuda automáticamente
 #  ✔ Registro de Trades en Google Sheets con trade_mode = "MARGIN"
 #  ✔ Debug extendido pero liviano (incluye snapshot de riesgo)
+#  ✔ BorrowSyncFix + BorrowRetry (multi-check balance hasta ~1.2s)
 #
 #  Se usa solo cuando USE_MARGIN = true en el router.
 #  Funciones llamadas:
@@ -19,6 +20,7 @@
 
 import os
 import math
+import time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
@@ -67,7 +69,7 @@ if API_KEY and API_SECRET and Client:
         client = Client(API_KEY, API_SECRET)
         client.ping()
         BINANCE_ENABLED = True
-        print("✅ Margin Client OK (initialization successful) — IRONCLAD V5 (2x)")
+        print("✅ Margin Client OK (initialization successful) — IRONCLAD V5.5 (2x + BorrowRetry)")
     except Exception as e:
         print(f"❌ Error Margin Client: {e}")
 else:
@@ -231,12 +233,18 @@ def get_total_borrow_used_ratio():
 # =============================================================
 
 def borrow_if_needed(asset, required_usdt):
+    """
+    Realiza borrow si free_margin_usdt < required_usdt.
+    Incluye logs de debug y limita precisión a 6 decimales.
+    """
     free = _get_margin_free_usdt()
     missing_raw = required_usdt - free
     missing_clean = max(0.0, missing_raw)
 
-    print(f"💳 borrow_if_needed → free={free:.6f}, required={required_usdt:.6f}, "
-          f"missing_raw={missing_raw:.6f}, missing_clean={missing_clean:.6f}")
+    print(
+        f"💳 borrow_if_needed → free={free:.6f}, required={required_usdt:.6f}, "
+        f"missing_raw={missing_raw:.6f}, missing_clean={missing_clean:.6f}"
+    )
 
     if missing_clean <= 0:
         return {"status": "NO_BORROW_NEEDED", "free": free}
@@ -245,7 +253,7 @@ def borrow_if_needed(asset, required_usdt):
     missing_clean = float(
         Decimal(str(missing_clean)).quantize(Decimal("1.000000"), rounding=ROUND_DOWN)
     )
-    print(f"🔧 borrow amount ajustado={missing_clean}")
+    print(f"🔧 borrow amount ajustado={missing_clean:.6f}")
 
     if DRY_RUN:
         return {"status": "DRY_RUN", "amount": missing_clean}
@@ -257,7 +265,6 @@ def borrow_if_needed(asset, required_usdt):
     except Exception as e:
         print(f"❌ ERROR borrow {asset}: {e}")
         return {"status": "BORROW_FAILED", "error": str(e)}
-
 
 
 def _repay_all_usdt_debt():
@@ -287,13 +294,12 @@ def _repay_all_usdt_debt():
         return {"status": "DRY_RUN", "debt": debt}
 
     try:
-        res = client.repay_margin_loan(asset="USDT", amount=str(debt))  # 👈 aquí el fix
+        res = client.repay_margin_loan(asset="USDT", amount=str(debt))
         print(f"💰 Repay ejecutado: {res}")
         return res
     except Exception as e:
         print(f"❌ ERROR repay: {e}")
         return {"status": "REPAY_FAILED", "error": str(e)}
-
 
 
 # =============================================================
@@ -353,11 +359,11 @@ def place_margin_sell(symbol, qty):
 
 
 # =============================================================
-# 5) HANDLE BUY SIGNAL — *IRONCLAD V5 (2x)*
+# 5) HANDLE BUY SIGNAL — *IRONCLAD V5.5 (2x + BorrowRetry)*
 # =============================================================
 
 def handle_margin_buy_signal(symbol):
-    print(f"\n========== 🟣 MARGIN BUY {symbol} — IRONCLAD V5 (2x) ==========")
+    print(f"\n========== 🟣 MARGIN BUY {symbol} — IRONCLAD V5.5 (2x + BorrowRetry) ==========")
 
     if not BINANCE_ENABLED:
         return {"status": "DISABLED"}
@@ -416,35 +422,45 @@ def handle_margin_buy_signal(symbol):
         print(f"❌ Borrow usage alto: {borrow_ratio:.3f}")
         return {"status": "risk_borrow_limit"}
 
-
     # ============================================================
-    # 🟣 Borrow si hace falta + BorrowSyncFix (V5.2)
+    # 🟣 Borrow si hace falta + BorrowSyncFix + BorrowRetry (V5.5)
     # ============================================================
     borrow_res = borrow_if_needed("USDT", safe_notional)
-    
+
     if borrow_res.get("status") == "BORROW_FAILED":
         print("❌ Abort BUY por error en borrow")
         return {"status": "borrow_failed", "detail": borrow_res}
-    
-    # Si hubo borrow, Binance tarda unos ms en reflejar el balance
-    if borrow_res.get("tranId"):
-        print("⏳ Borrow ejecutado — esperando sincronización de balance (250ms)...")
-        import time
-        time.sleep(0.25)
-    
-        refreshed_free = _get_margin_free_usdt()
-        print(f"🔄 Post-borrow balance check → free={refreshed_free:.6f}, required={safe_notional:.6f}")
-    
-        if refreshed_free + 0.0001 < safe_notional:
-            # Tolerancia de 0.0001 evita errores de floating point
-            print("❌ Balance NO actualizado después del borrow — BUY cancelado para evitar error -2010")
+
+    # Si NO hubo borrow (ya había suficiente USDT), seguimos directo
+    if borrow_res.get("status") in ("NO_BORROW_NEEDED", "DRY_RUN") or not borrow_res.get("tranId"):
+        print("ℹ️ No se requiere sincronización post-borrow (NO_BORROW_NEEDED/DRY_RUN)")
+    else:
+        print("⏳ Borrow ejecutado — iniciando sincronización de balance con retries...")
+
+        max_checks = 6          # hasta ~1.2s
+        sleep_between = 0.2     # 200ms entre checks
+        ok = False
+
+        for i in range(max_checks):
+            time.sleep(sleep_between)
+            refreshed_free = _get_margin_free_usdt()
+            print(
+                f"🔄 Post-borrow check {i+1}/{max_checks} → "
+                f"free={refreshed_free:.6f}, required={safe_notional:.6f}"
+            )
+            if refreshed_free + 0.0001 >= safe_notional:
+                ok = True
+                print("✅ Balance actualizado correctamente tras borrow — continuamos con BUY.")
+                break
+
+        if not ok:
+            print("❌ Balance NO se actualizó tras múltiples intentos — BUY cancelado para evitar error -2010")
             return {
                 "status": "BALANCE_NOT_READY",
-                "free": refreshed_free,
                 "required": safe_notional,
-                "borrow_tranId": borrow_res.get("tranId")
+                "last_free": refreshed_free,
+                "borrow_tranId": borrow_res.get("tranId"),
             }
-
 
     # Ejecutar BUY
     res = place_margin_buy(symbol, safe_notional)
@@ -486,7 +502,7 @@ def handle_margin_buy_signal(symbol):
 # =============================================================
 
 def handle_margin_sell_signal(symbol):
-    print(f"\n========== 🔴 MARGIN SELL {symbol} — IRONCLAD V5 ==========")
+    print(f"\n========== 🔴 MARGIN SELL {symbol} — IRONCLAD V5.5 ==========")
 
     if not BINANCE_ENABLED:
         return {"status": "DISABLED"}
