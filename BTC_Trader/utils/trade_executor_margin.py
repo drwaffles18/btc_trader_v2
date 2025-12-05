@@ -416,11 +416,35 @@ def handle_margin_buy_signal(symbol):
         print(f"❌ Borrow usage alto: {borrow_ratio:.3f}")
         return {"status": "risk_borrow_limit"}
 
-    # Borrow si hace falta
+
+    # ============================================================
+    # 🟣 Borrow si hace falta + BorrowSyncFix (V5.2)
+    # ============================================================
     borrow_res = borrow_if_needed("USDT", safe_notional)
+    
     if borrow_res.get("status") == "BORROW_FAILED":
         print("❌ Abort BUY por error en borrow")
         return {"status": "borrow_failed", "detail": borrow_res}
+    
+    # Si hubo borrow, Binance tarda unos ms en reflejar el balance
+    if borrow_res.get("tranId"):
+        print("⏳ Borrow ejecutado — esperando sincronización de balance (250ms)...")
+        import time
+        time.sleep(0.25)
+    
+        refreshed_free = _get_margin_free_usdt()
+        print(f"🔄 Post-borrow balance check → free={refreshed_free:.6f}, required={safe_notional:.6f}")
+    
+        if refreshed_free + 0.0001 < safe_notional:
+            # Tolerancia de 0.0001 evita errores de floating point
+            print("❌ Balance NO actualizado después del borrow — BUY cancelado para evitar error -2010")
+            return {
+                "status": "BALANCE_NOT_READY",
+                "free": refreshed_free,
+                "required": safe_notional,
+                "borrow_tranId": borrow_res.get("tranId")
+            }
+
 
     # Ejecutar BUY
     res = place_margin_buy(symbol, safe_notional)
