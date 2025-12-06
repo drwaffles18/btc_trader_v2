@@ -395,9 +395,8 @@ def place_margin_sell(symbol, qty):
 # =============================================================
 # 5) HANDLE BUY SIGNAL — *IRONCLAD V6 (2x + BorrowSync + BuyRetry)*
 # =============================================================
-
 def handle_margin_buy_signal(symbol):
-    print(f"\n========== 🟣 MARGIN BUY {symbol} — IRONCLAD V6 (2x) ==========")
+    print(f"\n========== 🟣 MARGIN BUY {symbol} — IRONCLAD V6.1 (2x + integer-borrow) ==========")
 
     if not BINANCE_ENABLED:
         return {"status": "DISABLED"}
@@ -456,6 +455,19 @@ def handle_margin_buy_signal(symbol):
         print(f"❌ Borrow usage alto: {borrow_ratio:.3f}")
         return {"status": "risk_borrow_limit"}
 
+    # ---------------------------------------------
+    # Detectar si el trade NECESITA borrow
+    # ---------------------------------------------
+    free_before = _get_margin_free_usdt()
+    missing_raw = safe_notional - free_before
+    needs_borrow = missing_raw > 0.0001
+
+    print(
+        f"🔍 Pre-borrow check → free_before={free_before:.6f}, "
+        f"safe_notional={safe_notional:.6f}, missing_raw={missing_raw:.6f}, "
+        f"needs_borrow={needs_borrow}"
+    )
+
     # Borrow si hace falta
     borrow_res = borrow_if_needed("USDT", safe_notional)
     if borrow_res.get("status") == "BORROW_FAILED":
@@ -469,18 +481,31 @@ def handle_margin_buy_signal(symbol):
         print("❌ Abort BUY → El balance prestado no está disponible todavía.")
         return {"status": "borrow_balance_not_ready"}
 
-    # Ejecutar BUY con retries (para proteger contra -2010 intermitente)
+    # ---------------------------------------------
+    # Modo entero si el trade dependía de borrow
+    # ---------------------------------------------
+    use_notional = safe_notional
+    if needs_borrow:
+        use_notional = float(math.floor(safe_notional))
+        print(f"🧮 Modo borrow-safe → Ejecutando BUY con entero={use_notional:.2f}")
+
+        if use_notional < min_notional:
+            print("❌ use_notional entero < min_notional, abortando.")
+            return {"status": "too_small_after_floor"}
+
+    # ---------------------------------------------
+    # Ejecutar BUY con retries usando use_notional
+    # ---------------------------------------------
     last_res = None
     for attempt in range(1, 4):
-        print(f"➡️ Intento BUY {attempt}/3...")
-        res = place_margin_buy(symbol, safe_notional)
+        print(f"➡️ Intento BUY {attempt}/3 con notional={use_notional:.6f}...")
+        res = place_margin_buy(symbol, use_notional)
         last_res = res
 
         if "error" not in res:
             break
 
         print(f"⚠️ BUY intento #{attempt} falló: {res['error']}")
-        # Si es DRY_RUN, no vale la pena seguir
         if DRY_RUN:
             break
         time.sleep(0.5)
@@ -492,7 +517,7 @@ def handle_margin_buy_signal(symbol):
     res = last_res
 
     qty = float(res.get("executedQty", 0))
-    quote = float(res.get("cummulativeQuoteQty", safe_notional))
+    quote = float(res.get("cummulativeQuoteQty", use_notional))
     entry_price = quote / qty if qty > 0 else _get_price(symbol)
 
     trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
@@ -511,13 +536,14 @@ def handle_margin_buy_signal(symbol):
         "trade_mode": "MARGIN",
     })
 
-    # Snapshot de riesgo post-trade (orientativo; puede variar ligeramente en Binance)
+    # Snapshot de riesgo post-trade (orientativo)
     mlevel_after = get_margin_level()
     borrow_ratio_after = get_total_borrow_used_ratio()
     print(f"📊 Risk snapshot post-trade → margin_level={mlevel_after:.2f}, borrow_ratio={borrow_ratio_after:.3f}")
 
     print(f"🟣 BUY completado qty={qty:.6f} entry={entry_price:.6f}")
     return res
+
 
 
 # =============================================================
