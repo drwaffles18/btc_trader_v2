@@ -456,13 +456,17 @@ def handle_margin_buy_signal(symbol):
         return {"status": "too_small_safe"}
 
     # Controles de riesgo (usamos los valores ya calculados)
-    if mlevel_before < 2.0:
-        print(f"❌ Margin level bajo: {mlevel_before:.2f}")
+    # Guardrail real basado en riesgo de liquidación
+    if mlevel_before < 1.50:
+        print(f"❌ Margin level bajo REAL: {mlevel_before:.2f}")
         return {"status": "risk_margin_level"}
 
-    if borrow_ratio > 0.40:
-        print(f"❌ Borrow usage alto: {borrow_ratio:.3f}")
-        return {"status": "risk_borrow_limit"}
+
+    #if borrow_ratio > 0.40:
+        #print(f"❌ Borrow usage alto: {borrow_ratio:.3f}")       estamos eliminando el uso de borrow ratio por el uso de margin level
+        #return {"status": "risk_borrow_limit"}
+
+    
 
     # ---------------------------------------------
     # Detectar si el trade NECESITA borrow
