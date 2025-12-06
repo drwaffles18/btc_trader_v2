@@ -271,6 +271,8 @@ def borrow_if_needed(asset, required_usdt):
 def _repay_all_usdt_debt():
     """
     Repaga toda la deuda de USDT.
+    Ahora formatea correctamente amount con 6 decimales (igual que borrow),
+    evitando errores -1100 por caracteres ilegales.
     """
     if not BINANCE_ENABLED:
         return {"status": "DISABLED"}
@@ -289,18 +291,25 @@ def _repay_all_usdt_debt():
         print("ℹ️ No hay deuda que repagar.")
         return {"status": "NO_DEBT"}
 
-    print(f"💰 Repagando deuda total USDT: {debt:.6f}")
+    # 👉 Nuevo: quantize para evitar errores de API
+    debt_clean = float(
+        Decimal(str(debt)).quantize(Decimal("1.000000"), rounding=ROUND_DOWN)
+    )
+
+    print(f"💰 Repagando deuda total USDT (clean) = {debt_clean:.6f}")
 
     if DRY_RUN:
-        return {"status": "DRY_RUN", "debt": debt}
+        print(f"💤 DRY_RUN repay {debt_clean}")
+        return {"status": "DRY_RUN", "debt": debt_clean}
 
     try:
-        res = client.repay_margin_loan(asset="USDT", amount=str(debt))
+        res = client.repay_margin_loan(asset="USDT", amount=str(debt_clean))
         print(f"💰 Repay ejecutado: {res}")
         return res
     except Exception as e:
-        print(f"❌ ERROR repay: {e}")
-        return {"status": "REPAY_FAILED", "error": str(e)}
+        print(f"❌ ERROR repay: {e} (amount={debt_clean})")
+        return {"status": "REPAY_FAILED", "error": str(e), "amount": debt_clean}
+
 
 
 # =============================================================
@@ -512,7 +521,14 @@ def handle_margin_buy_signal(symbol):
 
     if last_res is None or "error" in last_res:
         print("❌ BUY falló incluso tras retries.")
+    
+        # 👉 Nuevo: si llegamos aquí habiendo hecho borrow, intentamos repay
+        if needs_borrow:
+            print("⚠️ BUY falló tras borrow — intentando repagar deuda...")
+            _repay_all_usdt_debt()
+    
         return last_res if last_res is not None else {"error": "unknown_buy_error"}
+
 
     res = last_res
 
