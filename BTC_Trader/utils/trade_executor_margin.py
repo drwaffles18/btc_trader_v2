@@ -309,27 +309,31 @@ def _repay_all_usdt_debt():
 
 def _wait_for_real_balance(required, retries=6, delay=0.5):
     """
-    Espera a que el free balance refleje realmente el borrow.
-    Binance a veces tarda 300–2000ms en habilitar el balance prestado.
+    Espera a que el free balance refleje el borrow.
+    Usa tolerancia (epsilon) porque Binance retorna floats truncados.
     """
     if DRY_RUN or not BINANCE_ENABLED:
-        # En modo DRY_RUN o sin Binance real no tiene sentido esperar.
         return True
+
+    epsilon = 0.01  # tolerancia para compensar diferencias de float
 
     for i in range(retries):
         free_now = _get_margin_free_usdt()
+
         print(
             f"⏳ Real balance check {i+1}/{retries} → "
             f"free={free_now:.6f}, required={required:.6f}"
         )
 
-        if free_now >= required:
+        # Nuevo criterio con tolerancia
+        if free_now + epsilon >= required:
             return True
 
         time.sleep(delay)
 
-    print("❌ Balance real nunca alcanzó el requerido tras borrow.")
+    print("❌ Balance real nunca alcanzó el requerido (pero podría estar dentro de tolerancia).")
     return False
+
 
 
 # =============================================================
