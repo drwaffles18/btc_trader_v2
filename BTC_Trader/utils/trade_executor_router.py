@@ -19,6 +19,8 @@ import os
 
 USE_MARGIN = os.getenv("USE_MARGIN", "false").lower() == "true"
 print(f"🔧 [Router] USE_MARGIN = {USE_MARGIN}")
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
 
 # =============================================================
 # 2) Importar ejecutores reales
@@ -56,8 +58,13 @@ def route_signal(signal: dict):
     - En BUY llama al buy correcto (spot/margin)
     - En SELL llama al sell correcto
     """
+    
     side = signal.get("side", "").upper()
     symbol = signal.get("symbol")
+
+    if DRY_RUN:
+        print("🛑 GLOBAL DRY_RUN → trading, alerts y sheets DESACTIVADOS")
+        return {"status": "DRY_RUN_BLOCKED"}
 
     if not symbol or side not in ["BUY", "SELL"]:
         return {"status": "IGNORED", "detail": "Signal inválida"}
