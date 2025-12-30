@@ -62,6 +62,10 @@ SYMBOL_PARAMS = {
 # ==========================================================
 
 def enviar_mensaje_telegram(mensaje: str):
+    if DRY_RUN:
+        print("💤 DRY_RUN → Telegram deshabilitado")
+        return
+    
     if not TOKEN or not CHAT_ID:
         print("❌ ERROR: TOKEN o CHAT_ID no definidos", flush=True)
         return
@@ -177,48 +181,45 @@ def main():
             # --------------------------------------------------
             #      EJECUCIÓN DE TRADE (SPOT o MARGIN)
             # --------------------------------------------------
+            
+
+
             if debe_enviar:
-
-                if signal == 'BUY':
-                    mensaje = (
-                        f"🟢 BUY {symbol}\n"
-                        f"💵 Precio: {price:,.4f}\n"
-                        f"🕒 {fecha_cr}\n"
-                    )
-                    enviar_mensaje_telegram(mensaje)
-
-                    try:
-                        trade_result = route_signal({"symbol": symbol, "side": "BUY"})
-                        print(f"[{symbol}] 🛒 Resultado BUY: {trade_result}", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ [{symbol}] Error BUY (route_signal): {e}", flush=True)
-
-                elif signal == 'SELL':
-                    mensaje = (
-                        f"🔴 SELL {symbol}\n"
-                        f"💵 Precio: {price:,.4f}\n"
-                        f"🕒 {fecha_cr}\n"
-                    )
-                    enviar_mensaje_telegram(mensaje)
-
-                    try:
-                        trade_result = route_signal({"symbol": symbol, "side": "SELL"})
-                        print(f"[{symbol}] 💰 Resultado SELL: {trade_result}", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ [{symbol}] Error SELL (route_signal): {e}", flush=True)
-
-                # Guardamos la señal ejecutada y el last_close_ms procesado
+            
+                if DRY_RUN:
+                    print(f"💤 DRY_RUN activo → señal {signal} detectada pero NO ejecutada", flush=True)
+                else:
+                    if signal == 'BUY':
+                        mensaje = (
+                            f"🟢 BUY {symbol}\n"
+                            f"💵 Precio: {price:,.4f}\n"
+                            f"🕒 {fecha_cr}\n"
+                        )
+                        enviar_mensaje_telegram(mensaje)
+            
+                        try:
+                            trade_result = route_signal({"symbol": symbol, "side": "BUY"})
+                            print(f"[{symbol}] 🛒 Resultado BUY: {trade_result}", flush=True)
+                        except Exception as e:
+                            print(f"⚠️ [{symbol}] Error BUY (route_signal): {e}", flush=True)
+            
+                    elif signal == 'SELL':
+                        mensaje = (
+                            f"🔴 SELL {symbol}\n"
+                            f"💵 Precio: {price:,.4f}\n"
+                            f"🕒 {fecha_cr}\n"
+                        )
+                        enviar_mensaje_telegram(mensaje)
+            
+                        try:
+                            trade_result = route_signal({"symbol": symbol, "side": "SELL"})
+                            print(f"[{symbol}] 💰 Resultado SELL: {trade_result}", flush=True)
+                        except Exception as e:
+                            print(f"⚠️ [{symbol}] Error SELL (route_signal): {e}", flush=True)
+            
+                # Guardamos estado SIEMPRE
                 estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
 
-            else:
-                # ✅ Importante:
-                # Avanzamos SIEMPRE last_close_ms para no reprocesar velas.
-                # Y sincronizamos la señal con el régimen actual (curr_clean),
-                # para no perder transiciones si el bot se cae.
-                if curr_clean in ['BUY', 'SELL']:
-                    estado_actual[symbol] = {"signal": curr_clean, "last_close_ms": last_close_ms}
-                else:
-                    estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
 
         except Exception as e:
             print(f"❌ Error procesando {symbol}: {e}", flush=True)
