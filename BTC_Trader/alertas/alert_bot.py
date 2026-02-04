@@ -35,6 +35,9 @@ from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 BINANCE_API_KEY_TRADING    = os.getenv("BINANCE_API_KEY_TRADING")
 BINANCE_API_SECRET_TRADING = os.getenv("BINANCE_API_SECRET_TRADING")
 
+TRIGGER_SYMBOL = os.getenv("TRIGGER_SYMBOL", "BTCUSDT").upper()
+TRADE_SYMBOL   = os.getenv("TRADE_SYMBOL", "BNBUSDT").upper()
+
 DRY_RUN        = os.getenv("DRY_RUN", "false").lower() == "true"
 STATE_PATH     = os.getenv("STATE_PATH", "./estado.json")
 TRADE_LOG_PATH = os.getenv("TRADE_LOG_PATH", "./trade_logs.csv")
@@ -102,133 +105,121 @@ def _last_closed_for(symbol: str):
 
 def main():
     print("🚀 Iniciando verificación de señales 5m...", flush=True)
-
-    env_symbols = os.getenv("SYMBOLS")
-    symbols = [s.strip().upper() for s in env_symbols.split(",")] if env_symbols else \
-              ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
+    print(f"🎯 Trigger: {TRIGGER_SYMBOL}  |  💱 Trade: {TRADE_SYMBOL}", flush=True)
 
     # Cargar estado anterior (desde estado.json)
     estado_anterior = cargar_estado_anterior()
     estado_actual = {}
 
-    for symbol in symbols:
-        try:
-            print(f"\n===================== {symbol} =====================", flush=True)
+    symbol = TRIGGER_SYMBOL  # SOLO BTC como trigger
 
-            # 1) Última vela 5m cerrada
-            last_open_ms, last_close_ms, base, server_ms = _last_closed_for(symbol)
-            last_open_utc         = pd.to_datetime(last_open_ms,       unit="ms", utc=True)
-            last_close_utc_minus1 = pd.to_datetime(last_close_ms - 1,   unit="ms", utc=True)
+    try:
+        print(f"\n===================== TRIGGER {symbol} =====================", flush=True)
 
-            prev = estado_anterior.get(symbol, {"signal": None, "last_close_ms": 0})
-            prev_signal = prev.get("signal")
-            prev_close  = int(prev.get("last_close_ms") or 0)
+        # 1) Última vela 5m cerrada
+        last_open_ms, last_close_ms, base, server_ms = _last_closed_for(symbol)
+        last_open_utc         = pd.to_datetime(last_open_ms,       unit="ms", utc=True)
+        last_close_utc_minus1 = pd.to_datetime(last_close_ms - 1,   unit="ms", utc=True)
 
-            # 2) Grace period (ignorar si la señal está demasiado atrasada)
-            if GRACE_MINUTES > 0:
-                if (server_ms - last_close_ms) > GRACE_MINUTES * 60_000:
-                    print(f"⏭️ [{symbol}] Señal atrasada → ignorada. (server_ms - last_close_ms > grace)", flush=True)
-                    # Igual actualizamos last_close_ms para no quedarnos “pegados”
-                    estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
-                    continue
+        prev = estado_anterior.get(symbol, {"signal": None, "last_close_ms": 0})
+        prev_signal = prev.get("signal")
+        prev_close  = int(prev.get("last_close_ms") or 0)
 
-            # 3) Descargar histórico 5m
-            df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M, preferred_base=base)
-
-            params = SYMBOL_PARAMS[symbol]
-            df = calcular_momentum_fisico_speed(df, **params)
-
-            # 4) Limpiar señales (evitar repetidas consecutivas)
-            df_clean = limpiar_señales_consecutivas(df, columna='Momentum Signal')
-            df['Signal Final'] = df_clean['Signal Final']
-
-            # 5) Encontrar vela exacta
-            exact = df[
-                (df["Open time UTC"]  == last_open_utc) &
-                (df["Close time UTC"] == last_close_utc_minus1)
-            ]
-            if exact.empty:
-                print(f"⚠️ [{symbol}] No encontré la vela exacta para last_close_ms={last_close_ms}.", flush=True)
-                # Aun así avanzamos el last_close_ms para evitar quedar atrás.
+        # 2) Grace period
+        if GRACE_MINUTES > 0:
+            if (server_ms - last_close_ms) > GRACE_MINUTES * 60_000:
+                print(f"⏭️ [{symbol}] Señal atrasada → ignorada. (server_ms - last_close_ms > grace)", flush=True)
                 estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
-                continue
+                print(f"💾 Guardando estado actual: {estado_actual}", flush=True)
+                guardar_estado_actual(estado_actual)
+                print("✅ Finalizado", flush=True)
+                return
 
-            fila = exact.iloc[0]
-            curr_clean = fila['Signal Final']
-            price      = float(fila['Close'])
-            fecha_cr   = fila['Close time']
+        # 3) Descargar histórico 5m del TRIGGER (BTC)
+        df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M, preferred_base=base)
 
-            # 6) Señal anti-caídas:
-            #    - En lugar de comparar con la vela anterior (prev_clean),
-            #      comparamos con el estado anterior (prev_signal).
-            #    - Así, si el bot se cayó durante una transición, al volver igual ejecuta.
-            signal = None
-            if curr_clean in ['BUY', 'SELL'] and curr_clean != prev_signal:
-                signal = curr_clean
+        if symbol not in SYMBOL_PARAMS:
+            raise RuntimeError(f"No hay params en SYMBOL_PARAMS para {symbol}")
 
-            # 7) Debe ejecutar/enviar si:
-            #    - es una vela nueva (last_close_ms cambió)
-            #    - y hay una señal nueva (signal no None)
-            debe_enviar = (last_close_ms != prev_close) and (signal in ['BUY', 'SELL'])
+        params = SYMBOL_PARAMS[symbol]
+        df = calcular_momentum_fisico_speed(df, **params)
 
-            print(
-                f"[{symbol}] prev_signal={prev_signal} | curr_clean={curr_clean} | "
-                f"last_close_ms={last_close_ms} | prev_close={prev_close} | "
-                f"signal={signal} | ¿Debe enviar? {debe_enviar}",
-                flush=True
+        # 4) Limpiar señales (evitar repetidas consecutivas)
+        df_clean = limpiar_señales_consecutivas(df, columna='Momentum Signal')
+        df['Signal Final'] = df_clean['Signal Final']
+
+        # 5) Encontrar vela exacta
+        exact = df[
+            (df["Open time UTC"]  == last_open_utc) &
+            (df["Close time UTC"] == last_close_utc_minus1)
+        ]
+        if exact.empty:
+            print(f"⚠️ [{symbol}] No encontré la vela exacta para last_close_ms={last_close_ms}.", flush=True)
+            estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
+            print(f"💾 Guardando estado actual: {estado_actual}", flush=True)
+            guardar_estado_actual(estado_actual)
+            print("✅ Finalizado", flush=True)
+            return
+
+        fila = exact.iloc[0]
+        curr_clean = fila['Signal Final']
+        btc_price  = float(fila['Close'])
+        fecha_cr   = fila['Close time']
+
+        # 6) Señal anti-caídas basada en ESTADO del TRIGGER
+        signal = None
+        if curr_clean in ['BUY', 'SELL'] and curr_clean != prev_signal:
+            signal = curr_clean
+
+        # 7) Ejecutar/enviar si:
+        debe_enviar = (last_close_ms != prev_close) and (signal in ['BUY', 'SELL'])
+
+        print(
+            f"[{symbol}] prev_signal={prev_signal} | curr_clean={curr_clean} | "
+            f"last_close_ms={last_close_ms} | prev_close={prev_close} | "
+            f"signal={signal} | ¿Debe enviar? {debe_enviar}",
+            flush=True
+        )
+
+        # --------------------------------------------------
+        # EJECUCIÓN: señal de BTC, trade en BNB
+        # --------------------------------------------------
+        if debe_enviar:
+
+            # Mensaje de Telegram SIEMPRE con contexto de trigger/trade
+            emoji = "🟢" if signal == "BUY" else "🔴"
+            mensaje = (
+                f"{emoji} {signal} TRIGGER {symbol} → TRADE {TRADE_SYMBOL}\n"
+                f"📌 Trigger price ({symbol}): {btc_price:,.4f}\n"
+                f"🕒 {fecha_cr}\n"
             )
 
-            # --------------------------------------------------
-            #      EJECUCIÓN DE TRADE (SPOT o MARGIN)
-            # --------------------------------------------------
-            
+            if DRY_RUN:
+                print(f"💤 DRY_RUN activo → {mensaje}", flush=True)
+                # Opcional: si querés que DRY_RUN sí mande Telegram, quita este if y llama enviar_mensaje_telegram.
+            else:
+                enviar_mensaje_telegram(mensaje)
 
+                try:
+                    trade_result = route_signal({"symbol": TRADE_SYMBOL, "side": signal})
+                    print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado {signal}: {trade_result}", flush=True)
+                except Exception as e:
+                    print(f"⚠️ [TRADE {TRADE_SYMBOL}] Error {signal} (route_signal): {e}", flush=True)
 
-            if debe_enviar:
-            
-                if DRY_RUN:
-                    print(f"💤 DRY_RUN activo → señal {signal} detectada pero NO ejecutada", flush=True)
-                else:
-                    if signal == 'BUY':
-                        mensaje = (
-                            f"🟢 BUY {symbol}\n"
-                            f"💵 Precio: {price:,.4f}\n"
-                            f"🕒 {fecha_cr}\n"
-                        )
-                        enviar_mensaje_telegram(mensaje)
-            
-                        try:
-                            trade_result = route_signal({"symbol": symbol, "side": "BUY"})
-                            print(f"[{symbol}] 🛒 Resultado BUY: {trade_result}", flush=True)
-                        except Exception as e:
-                            print(f"⚠️ [{symbol}] Error BUY (route_signal): {e}", flush=True)
-            
-                    elif signal == 'SELL':
-                        mensaje = (
-                            f"🔴 SELL {symbol}\n"
-                            f"💵 Precio: {price:,.4f}\n"
-                            f"🕒 {fecha_cr}\n"
-                        )
-                        enviar_mensaje_telegram(mensaje)
-            
-                        try:
-                            trade_result = route_signal({"symbol": symbol, "side": "SELL"})
-                            print(f"[{symbol}] 💰 Resultado SELL: {trade_result}", flush=True)
-                        except Exception as e:
-                            print(f"⚠️ [{symbol}] Error SELL (route_signal): {e}", flush=True)
-            
-                # Guardamos estado SIEMPRE
-                estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
+            # Guardar estado del TRIGGER para evitar duplicados
+            estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
+        else:
+            # Importante: si NO ejecuta, igual conviene persistir el last_close_ms para no reprocesar
+            estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
 
-
-        except Exception as e:
-            print(f"❌ Error procesando {symbol}: {e}", flush=True)
-            # No rompemos el loop, pero intentamos no perder el last_close_ms si se pudo.
-            # (Aquí no tenemos last_close_ms garantizado, así que no forzamos estado.)
+    except Exception as e:
+        print(f"❌ Error procesando trigger {TRIGGER_SYMBOL}: {e}", flush=True)
+        # Si algo falló antes de calcular last_close_ms, no forzamos estado.
 
     print(f"💾 Guardando estado actual: {estado_actual}", flush=True)
     guardar_estado_actual(estado_actual)
     print("✅ Finalizado", flush=True)
+
 
 
 if __name__ == "__main__":
