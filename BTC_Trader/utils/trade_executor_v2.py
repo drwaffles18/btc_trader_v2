@@ -1,11 +1,14 @@
 # =============================================================
-# 🟢 Binance Spot Autotrader — Victor + GPT (versión estable sin OCO)
+# 🟢 Binance Spot Autotrader — Victor + GPT (BNB-only)
 # -------------------------------------------------------------
 # - BUY → Market buy usando quoteOrderQty
 # - SELL → Market sell full balance
 # - Logs en CSV y Google Sheets
-# - FIX: MIN_NOTIONAL opcional (BTCUSDT no lo trae)
-# - NEW: Columna trade_mode = "spot" en Google Sheets
+# - Columna trade_mode = "spot" en Google Sheets
+#
+# ✅ BNB-only guardrail:
+#    - Solo ejecuta trades si symbol == TRADE_SYMBOL (default BNBUSDT)
+#    - Sizing usa TRADE_WEIGHT (porcentaje del equity) en vez de PORTFOLIO multi-asset
 # =============================================================
 
 import os
@@ -25,24 +28,20 @@ LOG_FILE = "/app/data/trade_log.csv"
 
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
+# ✅ Single-asset mode
+TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "BNBUSDT").upper()
+TRADE_WEIGHT = float(os.getenv("TRADE_WEIGHT", "1.0"))  # 1.0 = 100% equity (capado por free_usdt)
+STRICT_TRADE_SYMBOL = os.getenv("STRICT_TRADE_SYMBOL", "true").lower() == "true"
+
 try:
     from binance.client import Client
-    from binance.enums import *
 except ImportError:
     Client = None
 
 API_KEY    = os.getenv("BINANCE_API_KEY_TRADING") or os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET_TRADING") or os.getenv("BINANCE_API_SECRET")
 
-PORTFOLIO_WEIGHTS = {
-    "BTCUSDT": 0.35,
-    "ETHUSDT": 0.25,
-    "ADAUSDT": 0.10,
-    "XRPUSDT": 0.20,
-    "BNBUSDT": 0.10,
-}
-
-BINANCE_NOTIONAL_FLOOR = 5.0  # 🔥 mínimo real para market orders
+BINANCE_NOTIONAL_FLOOR = 5.0  # mínimo real para market orders
 
 # -----------------------------
 # 1) INICIALIZACIÓN BINANCE
@@ -58,7 +57,7 @@ else:
         client = Client(API_KEY, API_SECRET)
         client.ping()
         BINANCE_ENABLED = True
-        print("✅ Cliente Binance inicializado.")
+        print(f"✅ Cliente Binance inicializado (SPOT). TRADE_SYMBOL={TRADE_SYMBOL} TRADE_WEIGHT={TRADE_WEIGHT}")
     except Exception as e:
         print(f"❌ Error al iniciar Binance: {e}")
         pd.DataFrame([{
@@ -105,7 +104,7 @@ def append_trade_row(ws, row_dict):
         row_dict["exit_time"],
         row_dict["profit_usdt"],
         row_dict["status"],
-        row_dict.get("trade_mode", "spot"),  # 👈 NEW
+        row_dict.get("trade_mode", "spot"),
     ]
     ws.append_row(row, value_input_option="RAW")
 
@@ -177,7 +176,7 @@ def _get_spot_equity_usdt():
         try:
             price = _get_price(symbol)
             total += qty * price
-        except:
+        except Exception:
             pass
     return total
 
@@ -196,8 +195,8 @@ def place_market_buy_by_quote(symbol, usdt_amount):
 
     if DRY_RUN:
         price = _get_price(symbol)
-        qty = usdt_clean / price
-        return {"symbol": symbol, "status": "FILLED", "executedQty": qty, "price": price}
+        qty = usdt_clean / price if price > 0 else 0.0
+        return {"symbol": symbol, "status": "FILLED", "executedQty": qty, "cummulativeQuoteQty": usdt_clean, "price": price}
 
     return client.create_order(
         symbol=symbol,
@@ -237,51 +236,50 @@ def sell_all_market(symbol):
 # -----------------------------
 
 def handle_buy_signal(symbol):
-    """BUY sin OCO + cálculo correcto del entry_price."""
+    """BUY Market (quoteOrderQty) + logging a Sheets (BNB-only)."""
     try:
+        symbol = (symbol or "").upper()
+
+        # ✅ Guardrail single-asset
+        if STRICT_TRADE_SYMBOL and symbol != TRADE_SYMBOL:
+            print(f"⛔ SPOT IGNORE → {symbol} != TRADE_SYMBOL {TRADE_SYMBOL}")
+            return {"status": "IGNORED_SYMBOL", "symbol": symbol, "trade_symbol": TRADE_SYMBOL}
+
         if not BINANCE_ENABLED:
             print(f"⚠️ BUY SKIPPED (no keys) {symbol}")
-            return
+            return {"status": "DISABLED"}
 
-        # === 1. Cálculo de cuánto invertir ===
+        # === 1) cuánto invertir (porcentaje del equity) ===
         equity = _get_spot_equity_usdt()
         free_usdt = _get_free_balance("USDT")
-        weight = PORTFOLIO_WEIGHTS.get(symbol, 0)
 
-        usdt_to_spend = min(equity * weight, free_usdt)
+        usdt_to_spend = min(equity * TRADE_WEIGHT, free_usdt)
 
         filters = _get_symbol_filters(symbol)
-
-        # 🔥 fallback si MIN_NOTIONAL está ausente (BTCUSDT por ejemplo)
         min_notional = filters["min_notional"] or BINANCE_NOTIONAL_FLOOR
         min_required = max(min_notional, BINANCE_NOTIONAL_FLOOR)
 
         if usdt_to_spend < min_required:
             print(f"❌ USDT insuficiente para {symbol}: {usdt_to_spend:.2f} < {min_required:.2f}")
-            return {"status": "INSUFFICIENT_USDT"}
+            return {"status": "INSUFFICIENT_USDT", "free_usdt": free_usdt, "equity": equity}
 
-        print(f"🟢 BUY {symbol} por {usdt_to_spend:.2f} USDT")
+        print(f"🟢 SPOT BUY {symbol} por {usdt_to_spend:.2f} USDT (TRADE_WEIGHT={TRADE_WEIGHT})")
 
-        # === 2. Ejecutar Market BUY ===
+        # === 2) ejecutar BUY ===
         order = place_market_buy_by_quote(symbol, usdt_to_spend)
 
-        # === 3. Extraer precio REAL del BUY ===
         executed_qty = float(order.get("executedQty", 0))
         quote_spent = float(order.get("cummulativeQuoteQty", usdt_to_spend))
 
-        # En MARKET BUY, Binance siempre retorna price = 0 → usamos el promedio real
         if executed_qty > 0:
             entry_price = quote_spent / executed_qty
         else:
-            # fallback ultra seguro
             entry_price = _get_price(symbol)
 
         qty = executed_qty
-
-        # === 4. Registrar ID ===
         trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
 
-        # === 5. Log CSV ===
+        # === 3) log csv ===
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": symbol,
@@ -292,7 +290,7 @@ def handle_buy_signal(symbol):
             "dry_run": DRY_RUN
         })
 
-        # === 6. Insertar en Google Sheets ===
+        # === 4) insert Sheets ===
         append_trade_row(ws_trades, {
             "trade_id": trade_id,
             "symbol": symbol,
@@ -304,7 +302,7 @@ def handle_buy_signal(symbol):
             "exit_time": "",
             "profit_usdt": "",
             "status": "OPEN",
-            "trade_mode": "spot",   # 👈 NEW
+            "trade_mode": "spot",
         })
 
         return order
@@ -313,11 +311,12 @@ def handle_buy_signal(symbol):
         print(f"❌ Error BUY {symbol}: {e}")
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
-            "symbol": symbol,
+            "symbol": (symbol or ""),
             "action": "ERROR_BUY",
             "message": str(e),
             "dry_run": DRY_RUN
         })
+        return {"status": "ERROR", "detail": str(e)}
 
 # -----------------------------
 # 7) SELL SIGNAL
@@ -325,18 +324,24 @@ def handle_buy_signal(symbol):
 
 def handle_sell_signal(symbol):
     try:
+        symbol = (symbol or "").upper()
+
+        # ✅ Guardrail single-asset
+        if STRICT_TRADE_SYMBOL and symbol != TRADE_SYMBOL:
+            print(f"⛔ SPOT IGNORE → {symbol} != TRADE_SYMBOL {TRADE_SYMBOL}")
+            return {"status": "IGNORED_SYMBOL", "symbol": symbol, "trade_symbol": TRADE_SYMBOL}
+
         if not BINANCE_ENABLED:
             print(f"⚠️ SELL SKIPPED (no keys) {symbol}")
-            return
+            return {"status": "DISABLED"}
 
-        print(f"🔴 SELL {symbol}")
+        print(f"🔴 SPOT SELL {symbol}")
         sell_res = sell_all_market(symbol)
 
         sell_price = float(_get_price(symbol))
 
-        # === Cargar trades ===
         trades = ws_trades.get_all_records()
-        open_trades = [t for t in trades if t["symbol"] == symbol and t["status"] == "OPEN"]
+        open_trades = [t for t in trades if t.get("symbol") == symbol and t.get("status") == "OPEN"]
 
         if not open_trades:
             print("⚠️ No hay trades abiertos para cerrar.")
@@ -349,7 +354,6 @@ def handle_sell_signal(symbol):
         qty = float(last["qty"])
         profit = (sell_price - entry_price) * qty
 
-        # === UPDATE SEGURO (compatible con API)
         # G: exit_price, H: exit_time, I: profit_usdt, J: status, K: trade_mode
         ws_trades.update(
             f"G{row_idx}:K{row_idx}",
@@ -358,7 +362,7 @@ def handle_sell_signal(symbol):
                 datetime.utcnow().isoformat(),
                 profit,
                 "CLOSED",
-                "spot"   # 👈 NEW
+                "spot"
             ]]
         )
 
@@ -378,22 +382,9 @@ def handle_sell_signal(symbol):
         print(f"❌ Error SELL {symbol}: {e}")
         _append_log({
             "timestamp": datetime.utcnow().isoformat(),
-            "symbol": symbol,
+            "symbol": (symbol or ""),
             "action": "ERROR_SELL",
             "message": str(e),
             "dry_run": DRY_RUN
         })
-
-# -----------------------------
-# 8) ROUTER LOCAL (no se usa con el router global)
-# -----------------------------
-
-def route_signal(signal):
-    side = signal.get("side", "").upper()
-    symbol = signal.get("symbol")
-
-    if side == "BUY":
-        return handle_buy_signal(symbol)
-    elif side == "SELL":
-        return handle_sell_signal(symbol)
-    return {"status": "IGNORED", "detail": "side no soportado"}
+        return {"status": "ERROR", "detail": str(e)}
