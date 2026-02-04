@@ -4,6 +4,9 @@
 # -------------------------------------------------------------
 # - Decide dinámicamente si usar Spot o Margin (USE_MARGIN)
 # - BLOQUEA símbolos no permitidos (ALLOWED_SYMBOLS / TRADE_SYMBOL)
+# - Soporta modo estricto vía:
+#       * STRICT_TRADE_SYMBOL (Railway actual)
+#       * STRICT_ALLOWED_SYMBOLS (opcional legacy)
 # - Compatible con:
 #       * utils.trade_executor_v2 (SPOT)
 #       * utils.trade_executor_margin (MARGIN)
@@ -18,24 +21,39 @@ import os
 USE_MARGIN = os.getenv("USE_MARGIN", "false").lower() == "true"
 DRY_RUN    = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# ✅ Nuevo: control de símbolos permitidos
-TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "BNBUSDT").upper()
+# Símbolo principal de trading (fallback default)
+TRADE_SYMBOL = (os.getenv("TRADE_SYMBOL") or "BNBUSDT").strip().upper()
 
-# Si ALLOWED_SYMBOLS no existe, se usa solo TRADE_SYMBOL.
+# Lista opcional de símbolos permitidos
 # Ejemplos:
 #   ALLOWED_SYMBOLS=BNBUSDT
-#   ALLOWED_SYMBOLS=BNBUSDT,BTCUSDT  (si un día quisieras permitir más)
-env_allowed = os.getenv("ALLOWED_SYMBOLS", "").strip()
+#   ALLOWED_SYMBOLS=BNBUSDT,BTCUSDT
+env_allowed = (os.getenv("ALLOWED_SYMBOLS") or "").strip()
+
 if env_allowed:
     ALLOWED_SYMBOLS = {s.strip().upper() for s in env_allowed.split(",") if s.strip()}
 else:
     ALLOWED_SYMBOLS = {TRADE_SYMBOL}
 
-# Para “modo estricto”: si true, bloquea cualquier symbol fuera de ALLOWED_SYMBOLS
-STRICT_ALLOWED_SYMBOLS = os.getenv("STRICT_ALLOWED_SYMBOLS", "true").lower() == "true"
+# ✅ Corrección: aseguramos que TRADE_SYMBOL esté siempre permitido
+ALLOWED_SYMBOLS.add(TRADE_SYMBOL)
+
+# -------------------------------------------------------------
+# Modo estricto
+# - Railway actual: STRICT_TRADE_SYMBOL
+# - Opcional legacy: STRICT_ALLOWED_SYMBOLS
+# Si cualquiera está en true → strict ON
+# -------------------------------------------------------------
+
+STRICT_TRADE_SYMBOL   = os.getenv("STRICT_TRADE_SYMBOL", "true").lower() == "true"
+STRICT_ALLOWED_SYMBOLS = os.getenv("STRICT_ALLOWED_SYMBOLS", "false").lower() == "true"
+
+STRICT_MODE = STRICT_TRADE_SYMBOL or STRICT_ALLOWED_SYMBOLS
 
 print(f"🔧 [Router] USE_MARGIN={USE_MARGIN} | DRY_RUN={DRY_RUN}", flush=True)
-print(f"🔒 [Router] ALLOWED_SYMBOLS={sorted(ALLOWED_SYMBOLS)} | STRICT_ALLOWED_SYMBOLS={STRICT_ALLOWED_SYMBOLS}", flush=True)
+print(f"🎯 [Router] TRADE_SYMBOL={TRADE_SYMBOL}", flush=True)
+print(f"🔒 [Router] ALLOWED_SYMBOLS={sorted(ALLOWED_SYMBOLS)} | STRICT_MODE={STRICT_MODE} "
+      f"(STRICT_TRADE_SYMBOL={STRICT_TRADE_SYMBOL}, STRICT_ALLOWED_SYMBOLS={STRICT_ALLOWED_SYMBOLS})", flush=True)
 
 # =============================================================
 # 2) Importar ejecutores reales
@@ -70,9 +88,14 @@ except Exception as e:
 def _symbol_allowed(symbol: str) -> bool:
     if not symbol:
         return False
-    symbol = symbol.upper()
-    if not STRICT_ALLOWED_SYMBOLS:
+
+    symbol = symbol.strip().upper()
+
+    # Si NO está en modo estricto → permitir todo
+    if not STRICT_MODE:
         return True
+
+    # Modo estricto → solo permitidos
     return symbol in ALLOWED_SYMBOLS
 
 # =============================================================
@@ -82,13 +105,13 @@ def _symbol_allowed(symbol: str) -> bool:
 def route_signal(signal: dict):
     """
     Señal universal del bot:
-    - Valida símbolo permitido
+    - Valida símbolo permitido (modo estricto)
     - En BUY llama al buy correcto (spot/margin)
     - En SELL llama al sell correcto
     """
 
-    side = (signal.get("side", "") or "").upper()
-    symbol = (signal.get("symbol", "") or "").upper()
+    side = (signal.get("side", "") or "").strip().upper()
+    symbol = (signal.get("symbol", "") or "").strip().upper()
 
     # ---------------------------------------------------------
     # 🛑 GLOBAL DRY_RUN
@@ -123,10 +146,7 @@ def route_signal(signal: dict):
             print("⚠️ [Router] USE_MARGIN=True pero margin executor no está disponible → usando SPOT", flush=True)
         else:
             print(f"🟣 [Router] Ejecutando vía MARGIN → {side} {symbol}", flush=True)
-            if side == "BUY":
-                return margin_buy(symbol)
-            else:
-                return margin_sell(symbol)
+            return margin_buy(symbol) if side == "BUY" else margin_sell(symbol)
 
     # ---------------------------------------------------------
     # 🟢 MODO SPOT (seguro por defecto)
@@ -135,7 +155,4 @@ def route_signal(signal: dict):
         return {"status": "ERROR", "detail": "Spot executor no disponible"}
 
     print(f"🟢 [Router] Ejecutando vía SPOT → {side} {symbol}", flush=True)
-    if side == "BUY":
-        return spot_buy(symbol)
-    else:
-        return spot_sell(symbol)
+    return spot_buy(symbol) if side == "BUY" else spot_sell(symbol)
