@@ -4,7 +4,7 @@
 # - Estrategia ACTIVA: WINNER/CHAMPION (Energy + Structure)
 # - Estrategia LEGACY (params): Momentum Físico Speed (dejada como fallback/manual)
 # - Anti-caídas: estado.json (transición real + last_close_ms)
-# - Railway: TRIGGER_SYMBOL=BTCUSDT | TRADE_SYMBOL/ALLOWED_SYMBOLS=BNBUSDT
+# - Telegram: incluye precio BTC (trigger) + precio BNB (trade)
 # ==========================================================
 
 import os
@@ -48,7 +48,6 @@ HISTORY_LIMIT_5M = int(os.getenv("HISTORY_LIMIT_5M", "900"))
 # Para logs claros (Railway)
 ALLOWED_SYMBOLS_ENV = (os.getenv("ALLOWED_SYMBOLS") or "").strip().upper()
 STRICT_TRADE_SYMBOL = os.getenv("STRICT_TRADE_SYMBOL", "true").lower() == "true"
-USE_MARGIN_ENV      = os.getenv("USE_MARGIN", "false").lower() == "true"
 
 print("==================================================", flush=True)
 print("🚀 alert_bot.py — BTC Trigger → BNB Exec (5m)", flush=True)
@@ -263,7 +262,6 @@ def main():
 
         # 1) Última vela 5m cerrada
         last_open_ms, last_close_ms, base, server_ms = _last_closed_for(symbol)
-        last_open_utc         = pd.to_datetime(last_open_ms, unit="ms", utc=True)
         last_close_utc_minus1 = pd.to_datetime(last_close_ms - 1, unit="ms", utc=True)
 
         prev = estado_anterior.get(symbol, {"signal": None, "last_close_ms": 0})
@@ -316,8 +314,18 @@ def main():
 
         row = sig.loc[ts]
         curr_clean = "BUY" if bool(row["BUY"]) else "SELL" if bool(row["SELL"]) else None
-        btc_price  = float(d.loc[ts, "Close"])
-        fecha_utc  = ts
+
+        btc_price = float(d.loc[ts, "Close"])
+
+        # Precio del asset a operar (BNB) para Telegram/logs
+        bnb_price = None
+        try:
+            df_trade = get_binance_5m_data(TRADE_SYMBOL, limit=2)
+            bnb_price = float(df_trade["Close"].iloc[-1])
+        except Exception as e:
+            print(f"[WARN] No pude obtener precio de {TRADE_SYMBOL}: {e}", flush=True)
+
+        print(f"[PRICE] trigger {symbol}={btc_price:.2f} | trade {TRADE_SYMBOL}={bnb_price}", flush=True)
 
         # 6) Anti-caídas: transición real + last_close_ms distinto
         signal = None
@@ -328,7 +336,7 @@ def main():
 
         print(
             f"[{symbol}] prev_signal={prev_signal} | curr={curr_clean} | "
-            f"ts={fecha_utc} | last_close_ms={last_close_ms} prev_close={prev_close} | "
+            f"ts={ts} | last_close_ms={last_close_ms} prev_close={prev_close} | "
             f"signal={signal} | EXEC? {debe_enviar}",
             flush=True
         )
@@ -336,10 +344,16 @@ def main():
         # 7) Ejecutar/enviar si corresponde
         if debe_enviar:
             emoji = "🟢" if signal == "BUY" else "🔴"
+
             mensaje = (
                 f"{emoji} {signal} TRIGGER {symbol} → TRADE {TRADE_SYMBOL}\n"
                 f"📌 Trigger price ({symbol}): {btc_price:,.4f}\n"
-                f"🕒 {fecha_utc}\n"
+            )
+            if bnb_price is not None:
+                mensaje += f"💰 Trade price ({TRADE_SYMBOL}): {bnb_price:,.4f}\n"
+
+            mensaje += (
+                f"🕒 {ts}\n"
                 f"⚙️ winner: zaccel_gate={P['zaccel_gate']} zenergy_min={ENTRY_ZENERGY_MIN} k_struct={ENTRY_K_STRUCT}\n"
             )
 
