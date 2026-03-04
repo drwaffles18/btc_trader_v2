@@ -496,7 +496,15 @@ def main():
             enviar_mensaje_telegram(mensaje)
 
             try:
-                trade_result = route_signal({"symbol": TRADE_SYMBOL, "side": signal})
+                trade_result = route_signal({
+                        "symbol": TRADE_SYMBOL,
+                        "side": signal,
+                        "context": {
+                            "ts": str(ts),
+                            "btc_price": btc_price,
+                            "bnb_price": bnb_price,
+                        }
+                    })
                 print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado {signal}: {trade_result}", flush=True)
             except Exception as e:
                 print(f"⚠️ [TRADE {TRADE_SYMBOL}] Error {signal} (route_signal): {e}", flush=True)
