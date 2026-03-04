@@ -1,5 +1,5 @@
 # =============================================================
-# utils/trade_executor_spot.py
+# utils/trade_executor_v2.py
 # 🟢 Spot Executor (BNB-only) — SAFE IMPORT
 # -------------------------------------------------------------
 # - NO hace llamadas Binance al importar el módulo
