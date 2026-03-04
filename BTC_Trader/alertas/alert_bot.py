@@ -14,6 +14,7 @@ import requests
 import pandas as pd
 import numpy as np
 import pytz
+from pandas.api.types import is_datetime64tz_dtype
 
 # Asegurar imports desde raíz del repo
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -141,27 +142,35 @@ def to_utc(ts) -> pd.Timestamp:
 
 def _parse_close_time_series(s: pd.Series) -> pd.DatetimeIndex:
     """
-    Convierte la columna 'Close time' a DatetimeIndex tz-aware en UTC.
-    - Si viene con offset (-06:00), SOLO tz_convert.
-    - Si viene naive, asume CR y tz_localize.
+    Convierte 'Close time' a DatetimeIndex tz-aware en UTC, robusto a:
+    - strings con offset (-06:00)
+    - datetime tz-aware
+    - mezcla rara (object) por lecturas durante escritura
     """
-    dt = pd.to_datetime(s, errors="coerce")
+    if s is None or len(s) == 0:
+        return pd.DatetimeIndex([], tz="UTC", name="ts")
 
-    # Caso 1: dtype datetime64[ns, tz] (lo normal cuando viene "-06:00")
+    # 1) Si ya es datetime tz-aware -> tz_convert directo
+    if is_datetime64tz_dtype(s):
+        return pd.DatetimeIndex(s.dt.tz_convert("UTC"), name="ts")
+
+    # 2) Forzar a string para evitar mezcla Timestamp/string/NaT en object
+    #    (Google Sheets a veces devuelve cosas raras si se lee mientras escriben)
+    s_str = s.astype(str).replace({"": np.nan, "None": np.nan, "nan": np.nan})
+
+    # 3) Parsear. Si viene con offset (-06:00), pandas lo entiende.
+    dt = pd.to_datetime(s_str, errors="coerce")
+
+    # 4) Si quedó tz-aware (porque el string tenía -06:00) -> tz_convert
     try:
-        tz = dt.dt.tz
+        if dt.dt.tz is not None:
+            return pd.DatetimeIndex(dt.dt.tz_convert("UTC"), name="ts")
     except Exception:
-        tz = None
+        pass
 
-    if tz is not None:
-        # YA tz-aware -> convertir a UTC
-        return pd.DatetimeIndex(dt.dt.tz_convert("UTC"), name="ts")
-
-    # Caso 2: naive -> asumir CR
-    return pd.DatetimeIndex(
-        dt.dt.tz_localize(CR, ambiguous="infer", nonexistent="shift_forward").dt.tz_convert("UTC"),
-        name="ts"
-    )
+    # 5) Si quedó naive -> asumir CR y localize, luego a UTC
+    dt = dt.dt.tz_localize(CR, ambiguous="infer", nonexistent="shift_forward").dt.tz_convert("UTC")
+    return pd.DatetimeIndex(dt, name="ts")
 
 def _expected_last_close_utc(now_utc: pd.Timestamp) -> pd.Timestamp:
     """
