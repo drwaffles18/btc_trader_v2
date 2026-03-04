@@ -209,6 +209,76 @@ with c4:
     )
 
 # ==============================
+# 🔥 RADAR / READINESS PANEL
+# ==============================
+st.markdown("### 🧭 Radar de Momentum BTC (0–100)")
+
+def _sigmoid_score(x: float) -> float:
+    # 0..100, suave, robusto
+    return float(100.0 / (1.0 + np.exp(-x)))
+
+# Scores (0..100)
+score_speed = _sigmoid_score(zspeed)
+score_accel = _sigmoid_score(zaccel)
+score_energy = _sigmoid_score(zenergy)
+score_struct = float(np.clip(struct_score, 0, 1) * 100.0)
+
+# Readiness (0..4)
+readiness = int(buy_raw) + int(gate_ok) + int(energy_ok) + int(zenergy_ok)
+
+r1, r2, r3, r4 = st.columns([1.1, 1.1, 1.1, 1.6])
+
+with r1:
+    st.metric("Readiness BUY", f"{readiness}/4")
+with r2:
+    st.metric("zspeed", f"{zspeed:.3f}")
+with r3:
+    st.metric("zaccel", f"{zaccel:.3f}")
+with r4:
+    st.metric("zenergy", f"{zenergy:.3f}  |  thr_eff", f"{thr_eff:.3f}")
+
+radar_df = pd.DataFrame({
+    "factor": ["Momentum Speed", "Momentum Accel", "Energy (z)", "Structure"],
+    "score":  [score_speed, score_accel, score_energy, score_struct],
+    "raw":    [zspeed, zaccel, zenergy, struct_score],
+})
+
+# Orden bonito (arriba→abajo)
+radar_df = radar_df.iloc[::-1].reset_index(drop=True)
+
+fig_radar = go.Figure()
+
+fig_radar.add_trace(go.Bar(
+    x=radar_df["score"],
+    y=radar_df["factor"],
+    orientation="h",
+    text=[f"{v:.0f}" for v in radar_df["score"]],
+    textposition="outside",
+))
+
+fig_radar.update_layout(
+    template="plotly_dark",
+    height=260,
+    margin=dict(l=10, r=10, t=10, b=10),
+    xaxis=dict(range=[0, 110], title="Score"),
+    yaxis=dict(title=""),
+)
+
+st.plotly_chart(fig_radar, use_container_width=True)
+
+# (Opcional) lista rápida de qué falta para BUY
+missing = []
+if not buy_raw: missing.append("buy_raw")
+if not gate_ok: missing.append("zaccel gate")
+if not energy_ok: missing.append("energy>0")
+if not zenergy_ok: missing.append("zenergy>=thr_eff")
+
+if readiness == 4:
+    st.success("✅ BUY está completamente habilitado (4/4).")
+else:
+    st.warning(f"⏳ BUY aún NO: faltan {', '.join(missing)}.")
+
+# ==============================
 # BTC CHART ONLY
 # ==============================
 st.markdown("### 📊 BTCUSDT — Señales Winner/Champion (últimas velas)")
@@ -277,3 +347,4 @@ components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
 width="100%" height="500"></iframe>
 """, height=500)
+
