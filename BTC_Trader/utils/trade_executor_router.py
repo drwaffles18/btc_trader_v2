@@ -55,7 +55,7 @@ print("==================================================", flush=True)
 #    IMPORTANTE: Estos módulos NO deben hacer Binance calls al import.
 # =============================================================
 
-from utils.trade_executor_spot import handle_spot_signal
+from utils.trade_executor_v2 import handle_spot_signal
 from utils.trade_executor_margin_exec import handle_margin_signal
 
 # =============================================================
