@@ -1,5 +1,5 @@
 # =============================================================
-# utils/trade_executor_margin_exec.py
+# utils/trade_executor_margin.py
 # 🟣 Cross Margin Executor (BNB-only) — SAFE IMPORT
 # -------------------------------------------------------------
 # - NO calls Binance en import
