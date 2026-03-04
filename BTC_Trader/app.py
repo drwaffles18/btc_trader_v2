@@ -58,6 +58,8 @@ def status_card(title: str, value: str, ok: bool, subtitle: str = ""):
     bg = "#198754" if ok else "#dc3545"
     fg = "#ffffff"
 
+    glow = "0 0 10px rgba(25,135,84,0.7)" if ok else "0 0 10px rgba(220,53,69,0.6)"
+
     st.markdown(
         f"""
         <div style="
@@ -67,10 +69,20 @@ def status_card(title: str, value: str, ok: bool, subtitle: str = ""):
             border-radius:12px;
             margin-bottom:10px;
             border:1px solid rgba(255,255,255,0.10);
+            box-shadow:{glow};
+            transition: all 0.25s ease;
         ">
-          <div style="font-weight:800;font-size:13px; letter-spacing:0.2px;">{title}</div>
-          <div style="font-size:18px;font-weight:900;margin-top:4px;">{value}</div>
-          <div style="font-size:12px;opacity:0.95;margin-top:6px; line-height:1.25;">{subtitle}</div>
+          <div style="font-weight:800;font-size:13px; letter-spacing:0.2px;">
+            {title}
+          </div>
+
+          <div style="font-size:18px;font-weight:900;margin-top:4px;">
+            {value}
+          </div>
+
+          <div style="font-size:12px;opacity:0.95;margin-top:6px; line-height:1.25;">
+            {subtitle}
+          </div>
         </div>
         """,
         unsafe_allow_html=True
@@ -347,5 +359,6 @@ components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
 width="100%" height="500"></iframe>
 """, height=500)
+
 
 
