@@ -54,9 +54,9 @@ ENTRY_N_DOWN      = 1
 # UI helpers
 # ==============================
 def status_card(title: str, value: str, ok: bool, subtitle: str = ""):
-    # ✅ verde con letra roja | ❌ rojo con letra blanca (como pediste)
+    # ✅ verde con letra blanca | ❌ rojo con letra blanca (como pediste)
     bg = "#198754" if ok else "#dc3545"
-    fg = "#ff3b30" if ok else "#ffffff"
+    fg = "#ffffff"
 
     st.markdown(
         f"""
@@ -347,4 +347,5 @@ components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
 width="100%" height="500"></iframe>
 """, height=500)
+
 
