@@ -13,6 +13,7 @@ import time
 import requests
 import pandas as pd
 import numpy as np
+import pytz
 
 # Asegurar imports desde raíz del repo
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -123,15 +124,44 @@ def enviar_mensaje_telegram(mensaje: str):
 # Sheets helpers
 # ==========================================================
 
+CR = pytz.timezone("America/Costa_Rica")
+
+def to_utc(ts) -> pd.Timestamp:
+    """
+    Acepta string/datetime/timestamp.
+    Devuelve Timestamp tz-aware en UTC.
+    """
+    t = pd.to_datetime(ts)
+    if getattr(t, "tzinfo", None) is None:
+        # naive -> asumir CR (o la tz que uses en sheets)
+        t = t.tz_localize(CR)
+    # aware -> convertir
+    return t.tz_convert("UTC")
+
+
 def _parse_close_time_series(s: pd.Series) -> pd.DatetimeIndex:
     """
-    Convierte la columna 'Close time' (local o con tz) a DatetimeIndex tz-aware en UTC.
+    Convierte la columna 'Close time' a DatetimeIndex tz-aware en UTC.
+    - Si viene con offset (-06:00), SOLO tz_convert.
+    - Si viene naive, asume CR y tz_localize.
     """
     dt = pd.to_datetime(s, errors="coerce")
-    if getattr(dt.dt, "tz", None) is None:
-        # Si viniera naive, asumimos Costa Rica (tu sheet normalmente trae -06:00)
-        dt = dt.dt.tz_localize("America/Costa_Rica")
-    return dt.dt.tz_convert("UTC")
+
+    # Caso 1: dtype datetime64[ns, tz] (lo normal cuando viene "-06:00")
+    try:
+        tz = dt.dt.tz
+    except Exception:
+        tz = None
+
+    if tz is not None:
+        # YA tz-aware -> convertir a UTC
+        return pd.DatetimeIndex(dt.dt.tz_convert("UTC"), name="ts")
+
+    # Caso 2: naive -> asumir CR
+    return pd.DatetimeIndex(
+        dt.dt.tz_localize(CR, ambiguous="infer", nonexistent="shift_forward").dt.tz_convert("UTC"),
+        name="ts"
+    )
 
 def _expected_last_close_utc(now_utc: pd.Timestamp) -> pd.Timestamp:
     """
@@ -190,7 +220,7 @@ def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame
             # porque tu 'Close time' es ...:59.999 local, equivalente a close_ms-1 en el enfoque anterior
             last_close_ms = int((ts_last + pd.Timedelta(milliseconds=1)).value // 1_000_000)
 
-            now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+            now_utc = pd.Timestamp.now(tz="UTC")
             expected = _expected_last_close_utc(now_utc)
 
             ok_expected = ts_last >= expected
@@ -221,7 +251,37 @@ def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame
             if waited >= MAX_WAIT_SECONDS:
                 raise RuntimeError(f"[SHEETS] No pude obtener data fresca para {symbol}. Último error: {last_err}")
             time.sleep(POLL_EVERY_SEC)
+            
+def _wait_trade_sheet_at_least(symbol: str, target_ts: pd.Timestamp) -> pd.DataFrame:
+    """
+    Espera hasta que el sheet de TRADE_SYMBOL tenga ts_last >= target_ts.
+    """
+    t0 = time.time()
+    last_err = None
 
+    while True:
+        try:
+            ohlcv = _load_ohlcv_from_sheet(symbol)
+            ts_last = ohlcv.index.max()
+
+            if pd.notna(ts_last) and ts_last >= target_ts:
+                return ohlcv
+
+            waited = int(time.time() - t0)
+            if waited >= MAX_WAIT_SECONDS:
+                print(f"⏳ [SHEETS] timeout esperando {symbol}. ts_last={ts_last} target_ts={target_ts}", flush=True)
+                return ohlcv
+
+            print(f"⏳ [SHEETS] esperando {symbol}... ts_last={ts_last} target_ts={target_ts}", flush=True)
+            time.sleep(POLL_EVERY_SEC)
+
+        except Exception as e:
+            last_err = e
+            waited = int(time.time() - t0)
+            if waited >= MAX_WAIT_SECONDS:
+                print(f"⚠️ [SHEETS] no pude leer {symbol} a tiempo: {last_err}", flush=True)
+                return _load_ohlcv_from_sheet(symbol)
+            time.sleep(POLL_EVERY_SEC)
 
 # ==========================================================
 # WINNER/CHAMPION functions (Energy + Structure)
@@ -387,8 +447,8 @@ def main():
         # 4) Precio BNB desde Sheets (última vela cerrada)
         bnb_price = None
         try:
-            bnb_ohlcv = _load_ohlcv_from_sheet(TRADE_SYMBOL)
-            bnb_price = float(bnb_ohlcv["Close"].iloc[-1])
+            bnb_ohlcv = _wait_trade_sheet_at_least(TRADE_SYMBOL, ts)
+            bnb_price = float(bnb_ohlcv.loc[bnb_ohlcv.index.max(), "Close"])
         except Exception as e:
             print(f"[WARN] No pude obtener precio de {TRADE_SYMBOL} desde Sheets: {e}", flush=True)
 
