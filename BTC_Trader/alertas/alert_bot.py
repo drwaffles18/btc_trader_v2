@@ -488,8 +488,9 @@ def main():
             if bnb_price is not None:
                 mensaje += f"💰 Trade price ({TRADE_SYMBOL}): {bnb_price:,.4f}\n"
 
+            ts_cr = ts.tz_convert(CR)
             mensaje += (
-                f"🕒 {ts}\n"
+                f"🕒 {ts_cr.isoformat()}\n"
                 f"⚙️ winner: zaccel_gate={P['zaccel_gate']} zenergy_min={ENTRY_ZENERGY_MIN} k_struct={ENTRY_K_STRUCT}\n"
             )
 
