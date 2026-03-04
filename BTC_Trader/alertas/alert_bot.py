@@ -2,13 +2,14 @@
 # alertas/alert_bot.py
 # 5m BTC Trigger → BNB Execution (Spot/Margin via Router)
 # - Estrategia ACTIVA: WINNER/CHAMPION (Energy + Structure)
-# - Estrategia LEGACY (params): Momentum Físico Speed (dejada como fallback/manual)
+# - Datos: Google Sheets (1200 velas) + wait/poll para esperar incremental job
 # - Anti-caídas: estado.json (transición real + last_close_ms)
 # - Telegram: incluye precio BTC (trigger) + precio BNB (trade)
 # ==========================================================
 
 import os
 import sys
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -16,15 +17,8 @@ import numpy as np
 # Asegurar imports desde raíz del repo
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from utils.binance_fetch import (
-    get_binance_5m_data,
-    fetch_last_closed_kline_5m,
-    bases_para,
-)
-
-# Router de ejecución (Spot/Margin)
+from utils.load_from_sheets import load_symbol_df
 from utils.trade_executor_router import route_signal
-
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 
@@ -42,19 +36,23 @@ TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 USE_MARGIN = os.getenv("USE_MARGIN", "false").lower() == "true"
-GRACE_MINUTES    = int(os.getenv("GRACE_MINUTES", "7"))
-HISTORY_LIMIT_5M = int(os.getenv("HISTORY_LIMIT_5M", "900"))
+
+# Espera para que el incremental job termine de escribir en Sheets
+# (tu log: ~37s a ~60s total)
+MAX_WAIT_SECONDS = int(os.getenv("MAX_WAIT_SECONDS", "90"))
+POLL_EVERY_SEC   = int(os.getenv("POLL_EVERY_SEC", "6"))
 
 # Para logs claros (Railway)
 ALLOWED_SYMBOLS_ENV = (os.getenv("ALLOWED_SYMBOLS") or "").strip().upper()
 STRICT_TRADE_SYMBOL = os.getenv("STRICT_TRADE_SYMBOL", "true").lower() == "true"
 
 print("==================================================", flush=True)
-print("🚀 alert_bot.py — BTC Trigger → BNB Exec (5m)", flush=True)
+print("🚀 alert_bot.py — BTC Trigger → BNB Exec (5m) [SHEETS MODE]", flush=True)
 print(f"🔧 DRY_RUN={DRY_RUN} | USE_MARGIN={USE_MARGIN}", flush=True)
 print(f"🎯 TRIGGER_SYMBOL={TRIGGER_SYMBOL}", flush=True)
 print(f"💱 TRADE_SYMBOL={TRADE_SYMBOL}", flush=True)
 print(f"🔒 STRICT_TRADE_SYMBOL={STRICT_TRADE_SYMBOL} | ALLOWED_SYMBOLS={ALLOWED_SYMBOLS_ENV or '(not set)'}", flush=True)
+print(f"⏳ WAIT: MAX_WAIT_SECONDS={MAX_WAIT_SECONDS} | POLL_EVERY_SEC={POLL_EVERY_SEC}", flush=True)
 print("==================================================", flush=True)
 
 
@@ -70,6 +68,7 @@ SYMBOL_PARAMS = {
     "XRPUSDT": {"mom_win": 5, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.2, "zaccel_min": 0.0},
     "BNBUSDT": {"mom_win": 6, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.0},
 }
+
 
 # ==========================================================
 # ACTIVE STRATEGY — WINNER/CHAMPION CONFIG (BTC→BNB)
@@ -118,6 +117,110 @@ def enviar_mensaje_telegram(mensaje: str):
             print(f"⚠️ Telegram error: {r.text}", flush=True)
     except Exception as e:
         print(f"⚠️ Telegram excepción: {e}", flush=True)
+
+
+# ==========================================================
+# Sheets helpers
+# ==========================================================
+
+def _parse_close_time_series(s: pd.Series) -> pd.DatetimeIndex:
+    """
+    Convierte la columna 'Close time' (local o con tz) a DatetimeIndex tz-aware en UTC.
+    """
+    dt = pd.to_datetime(s, errors="coerce")
+    if getattr(dt.dt, "tz", None) is None:
+        # Si viniera naive, asumimos Costa Rica (tu sheet normalmente trae -06:00)
+        dt = dt.dt.tz_localize("America/Costa_Rica")
+    return dt.dt.tz_convert("UTC")
+
+def _expected_last_close_utc(now_utc: pd.Timestamp) -> pd.Timestamp:
+    """
+    La vela "cerrada" más reciente tiene close_time = (floor_5m(now) - 1ms).
+    Ej: 11:04:59.999...
+    """
+    floor_5m = now_utc.floor("5min")
+    return floor_5m - pd.Timedelta(milliseconds=1)
+
+def _load_ohlcv_from_sheet(symbol: str) -> pd.DataFrame:
+    """
+    Carga df desde Sheets y devuelve OHLCV con index = Close time UTC.
+    Requiere columnas: Open, High, Low, Close, Volume, Close time
+    """
+    df = load_symbol_df(symbol)
+    if df is None or df.empty:
+        raise RuntimeError(f"[SHEETS] {symbol}: DF vacío")
+
+    required = ["Open", "High", "Low", "Close", "Volume", "Close time"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"[SHEETS] {symbol}: faltan columnas {missing} (requiere {required})")
+
+    close_utc = _parse_close_time_series(df["Close time"])
+    out = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    out.index = pd.DatetimeIndex(close_utc, name="ts")
+    out = out.sort_index()
+
+    # numeric
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    out["Volume"] = out["Volume"].fillna(0.0)
+
+    return out
+
+def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame, pd.Timestamp, int]:
+    """
+    Espera hasta que Sheets tenga la última vela cerrada (o al menos una vela NUEVA vs prev_close_ms),
+    para evitar leer antes de que termine el incremental job.
+
+    Return:
+      ohlcv (index=close_time_utc), ts_last (close_time_utc), last_close_ms (epoch ms aproximado)
+    """
+    t0 = time.time()
+    last_err = None
+
+    while True:
+        try:
+            ohlcv = _load_ohlcv_from_sheet(symbol)
+            ts_last = ohlcv.index.max()
+            if pd.isna(ts_last):
+                raise RuntimeError("ts_last es NaT")
+
+            # Aproximación last_close_ms: (ts_last + 1ms) en epoch ms
+            # porque tu 'Close time' es ...:59.999 local, equivalente a close_ms-1 en el enfoque anterior
+            last_close_ms = int((ts_last + pd.Timedelta(milliseconds=1)).value // 1_000_000)
+
+            now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+            expected = _expected_last_close_utc(now_utc)
+
+            ok_expected = ts_last >= expected
+            ok_new = last_close_ms != int(prev_close_ms or 0)
+
+            if ok_expected or ok_new:
+                # si está al día o al menos avanzó vs estado anterior, seguimos
+                return ohlcv, ts_last, last_close_ms
+
+            # Si no está fresco, esperamos
+            waited = int(time.time() - t0)
+            if waited >= MAX_WAIT_SECONDS:
+                print(
+                    f"⏳ [SHEETS] timeout esperando vela fresca. ts_last={ts_last} expected≈{expected} prev_close_ms={prev_close_ms}",
+                    flush=True
+                )
+                return ohlcv, ts_last, last_close_ms
+
+            print(
+                f"⏳ [SHEETS] esperando incremental... ts_last={ts_last} expected≈{expected} (sleep {POLL_EVERY_SEC}s)",
+                flush=True
+            )
+            time.sleep(POLL_EVERY_SEC)
+
+        except Exception as e:
+            last_err = e
+            waited = int(time.time() - t0)
+            if waited >= MAX_WAIT_SECONDS:
+                raise RuntimeError(f"[SHEETS] No pude obtener data fresca para {symbol}. Último error: {last_err}")
+            time.sleep(POLL_EVERY_SEC)
 
 
 # ==========================================================
@@ -231,27 +334,10 @@ def simulate_sellraw_only(d: pd.DataFrame, buy_ok: pd.Series) -> pd.DataFrame:
 
 
 # ==========================================================
-# Last closed 5m candle (server-confirmed)
-# ==========================================================
-
-def _last_closed_for(symbol: str):
-    for base in bases_para(symbol):
-        try:
-            k, last_open, last_close, server_ms = fetch_last_closed_kline_5m(symbol, base)
-            print(f"[{symbol}] Última 5m cerrada confirmada con {base}", flush=True)
-            return last_open, last_close, base, server_ms
-        except Exception as e:
-            print(f"[{symbol}] fallo confirmando en {base}: {e}", flush=True)
-
-    raise RuntimeError(f"[{symbol}] No se pudo confirmar la última vela cerrada 5m.")
-
-
-# ==========================================================
 # MAIN
 # ==========================================================
 
 def main():
-    # Cargar estado anterior (estado.json)
     estado_anterior = cargar_estado_anterior()
     estado_actual = {}
 
@@ -260,35 +346,16 @@ def main():
     try:
         print(f"\n===================== TRIGGER {symbol} =====================", flush=True)
 
-        # 1) Última vela 5m cerrada
-        last_open_ms, last_close_ms, base, server_ms = _last_closed_for(symbol)
-        last_close_utc_minus1 = pd.to_datetime(last_close_ms - 1, unit="ms", utc=True)
-
         prev = estado_anterior.get(symbol, {"signal": None, "last_close_ms": 0})
         prev_signal = prev.get("signal")
         prev_close  = int(prev.get("last_close_ms") or 0)
 
-        # 2) Grace period
-        if GRACE_MINUTES > 0 and (server_ms - last_close_ms) > GRACE_MINUTES * 60_000:
-            print(f"⏭️ [{symbol}] Señal atrasada → ignorada (grace).", flush=True)
-            estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
-            print(f"💾 Estado: {estado_actual}", flush=True)
-            guardar_estado_actual(estado_actual)
-            print("✅ Finalizado", flush=True)
-            return
+        # 1) Esperar / leer velas de BTC desde Sheets
+        btc_ohlcv, ts_last, last_close_ms = _wait_for_fresh_sheet(symbol, prev_close)
 
-        # 3) Descargar histórico 5m del TRIGGER (BTC)
-        df = get_binance_5m_data(symbol, limit=HISTORY_LIMIT_5M, preferred_base=base)
-
-        # Adaptar a OHLCV con índice = Close time UTC (para matchear last_close_utc_minus1)
-        btc_ohlcv = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-        btc_ohlcv.index = pd.to_datetime(df["Close time UTC"], utc=True)
-        btc_ohlcv = btc_ohlcv.sort_index()
-
-        # 4) Señales winner/champion
+        # 2) Señales winner/champion sobre BTC
         d = build_features_winner(btc_ohlcv)
 
-        # Logs útiles (Railway)
         try:
             zenergy_max = float(np.nanmax(d["zenergy"]))
             zaccel_max  = float(np.nanmax(d["zaccel"]))
@@ -304,8 +371,8 @@ def main():
             flush=True
         )
 
-        # 5) Leer señal en la vela cerrada exacta
-        ts = last_close_utc_minus1
+        # 3) La vela “a evaluar” es la ÚLTIMA cerrada en Sheets (ts_last)
+        ts = ts_last
         if ts not in sig.index:
             print(f"⚠️ [{symbol}] No encontré ts exacto en winner signals: {ts}", flush=True)
             estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
@@ -317,17 +384,17 @@ def main():
 
         btc_price = float(d.loc[ts, "Close"])
 
-        # Precio del asset a operar (BNB) para Telegram/logs
+        # 4) Precio BNB desde Sheets (última vela cerrada)
         bnb_price = None
         try:
-            df_trade = get_binance_5m_data(TRADE_SYMBOL, limit=2)
-            bnb_price = float(df_trade["Close"].iloc[-1])
+            bnb_ohlcv = _load_ohlcv_from_sheet(TRADE_SYMBOL)
+            bnb_price = float(bnb_ohlcv["Close"].iloc[-1])
         except Exception as e:
-            print(f"[WARN] No pude obtener precio de {TRADE_SYMBOL}: {e}", flush=True)
+            print(f"[WARN] No pude obtener precio de {TRADE_SYMBOL} desde Sheets: {e}", flush=True)
 
         print(f"[PRICE] trigger {symbol}={btc_price:.2f} | trade {TRADE_SYMBOL}={bnb_price}", flush=True)
 
-        # 6) Anti-caídas: transición real + last_close_ms distinto
+        # 5) Anti-caídas: transición real + vela nueva
         signal = None
         if curr_clean in ["BUY", "SELL"] and curr_clean != prev_signal:
             signal = curr_clean
@@ -341,7 +408,7 @@ def main():
             flush=True
         )
 
-        # 7) Ejecutar/enviar si corresponde
+        # 6) Ejecutar/enviar
         if debe_enviar:
             emoji = "🟢" if signal == "BUY" else "🔴"
 
