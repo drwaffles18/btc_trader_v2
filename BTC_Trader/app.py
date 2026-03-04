@@ -1,178 +1,279 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
 
-# --- IMPORTACIONES PERSONALIZADAS ---
-from utils.indicators import calcular_momentum_fisico_speed
-from utils.signal_postprocessing import limpiar_señales_consecutivas
 from utils.load_from_sheets import load_symbol_df
 
-# --- CONFIGURACIÓN INICIAL ---
-st.set_page_config(page_title="Cripto Señales Multi-Token (5m)", layout="wide")
-st.title("📊 Señales Automatizadas — Momentum Físico (5m)")
+# ✅ estrategia actual (winner/champion)
+from utils.strategy_winner_champion import (
+    build_features_winner,
+    buy_signal_champion,
+    simulate_sellraw_only,
+    struct_modulated_threshold,
+)
+
+# ==============================
+# CONFIG
+# ==============================
+st.set_page_config(page_title="BTCUSDT — Winner/Champion (5m)", layout="wide")
+st.title("📊 BTCUSDT — Winner/Champion (5m)")
 
 # Auto refresh cada 5 minutos
 st_autorefresh(interval=300000, key="auto_refresh_5m")
 
-symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "XRPUSDT", "BNBUSDT"]
+SYMBOL = "BTCUSDT"
+MAX_VELAS = 220  # ajusta si quieres
 
-# --- PARÁMETROS POR TOKEN ---
-SYMBOL_PARAMS = {
-    "BTCUSDT": {"mom_win": 4, "speed_win": 9, "accel_win": 7, "zspeed_min": 0.3, "zaccel_min": 0.1},
-    "ETHUSDT": {"mom_win": 7, "speed_win": 9, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.2},
-    "ADAUSDT": {"mom_win": 4, "speed_win": 7, "accel_win": 5, "zspeed_min": 0.2, "zaccel_min": 0.3},
-    "XRPUSDT": {"mom_win": 5, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.2, "zaccel_min": 0.0},
-    "BNBUSDT": {"mom_win": 6, "speed_win": 7, "accel_win": 9, "zspeed_min": 0.3, "zaccel_min": 0.0},
-}
+# ==============================
+# PARÁMETROS (igual que alert_bot)
+# ==============================
+P = dict(
+    mom_win=4,
+    speed_win=9,
+    accel_win=7,
+    z_win=20,
+    zspeed_min=0.30,
+    zaccel_min=0.10,
+    zaccel_gate=4.0
+)
 
-# ---------------------------------------
-# 🚀 CACHE INTELIGENTE PARA ACELERAR TODO
-# ---------------------------------------
-@st.cache_data(ttl=240)   # cache 4 minutos
-def procesar_symbol(symbol):
-    """Carga el DF desde Sheets, calcula momentum físico y limpia señales consecutivas."""
-    df = load_symbol_df(symbol).copy()
+ENERGY_ZWIN = 120
+STRUCT_ZWIN = 120
+STRUCT_WIN  = 48
+DON_WIN     = 48
 
-    params = SYMBOL_PARAMS[symbol]
-    df = calcular_momentum_fisico_speed(
-        df,
-        mom_win=params["mom_win"],
-        speed_win=params["speed_win"],
-        accel_win=params["accel_win"],
-        zspeed_min=params["zspeed_min"],
-        zaccel_min=params["zaccel_min"]
+ENTRY_ZENERGY_MIN = 1.8
+ENTRY_K_STRUCT    = 0.4
+ENTRY_USE_ASYM    = False
+ENTRY_N_DOWN      = 1
+
+# ==============================
+# UI helpers
+# ==============================
+def status_card(title: str, value: str, ok: bool, subtitle: str = ""):
+    # ✅ verde con letra roja | ❌ rojo con letra blanca (como pediste)
+    bg = "#198754" if ok else "#dc3545"
+    fg = "#ff3b30" if ok else "#ffffff"
+
+    st.markdown(
+        f"""
+        <div style="
+            background:{bg};
+            color:{fg};
+            padding:12px 14px;
+            border-radius:12px;
+            margin-bottom:10px;
+            border:1px solid rgba(255,255,255,0.10);
+        ">
+          <div style="font-weight:800;font-size:13px; letter-spacing:0.2px;">{title}</div>
+          <div style="font-size:18px;font-weight:900;margin-top:4px;">{value}</div>
+          <div style="font-size:12px;opacity:0.95;margin-top:6px; line-height:1.25;">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    # limpiar duplicados: BUY-BUY-BUY / SELL-SELL-SELL
-    df = limpiar_señales_consecutivas(df, columna="Momentum Signal")
-
+@st.cache_data(ttl=240)
+def load_btc_df() -> pd.DataFrame:
+    df = load_symbol_df(SYMBOL).copy()
     return df
 
+def prep_ohlcv_for_strategy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza DF de Sheets → OHLCV indexado por tiempo y numérico.
+    La estrategia solo requiere: Open, High, Low, Close, Volume.
+    """
+    d = df.copy()
+
+    # Elegir columna de tiempo para index (preferimos Open time)
+    if "Open time" in d.columns:
+        d["Open time"] = pd.to_datetime(d["Open time"], errors="coerce")
+        d = d.dropna(subset=["Open time"]).sort_values("Open time").set_index("Open time")
+    elif "Close time" in d.columns:
+        d["Close time"] = pd.to_datetime(d["Close time"], errors="coerce")
+        d = d.dropna(subset=["Close time"]).sort_values("Close time").set_index("Close time")
+    else:
+        # sin tiempo, igual intentamos pero el chart quedará raro
+        d = d.reset_index(drop=True)
+
+    # Numéricos
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    d = d.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if "Volume" in d.columns:
+        d["Volume"] = d["Volume"].fillna(0.0)
+
+    return d
 
 # ==============================
-# 🔹 ÚLTIMAS SEÑALES
+# LOAD + STRATEGY
 # ==============================
-st.markdown("### 🔹 Últimas Señales por Token (5m)")
+try:
+    df_raw = load_btc_df()
+    df = prep_ohlcv_for_strategy(df_raw)
 
-for symbol in symbols:
-    try:
-        df = procesar_symbol(symbol)
-        df_valid = df.dropna(subset=['Momentum Signal'])
+    d = build_features_winner(
+        df,
+        P=P,
+        ENERGY_ZWIN=ENERGY_ZWIN,
+        STRUCT_ZWIN=STRUCT_ZWIN,
+        STRUCT_WIN=STRUCT_WIN,
+        DON_WIN=DON_WIN,
+    )
 
-        if df_valid.empty:
-            st.info(f"Sin señales aún para {symbol}.")
-            continue
+    buy_ok = buy_signal_champion(
+        d,
+        P=P,
+        ENTRY_ZENERGY_MIN=ENTRY_ZENERGY_MIN,
+        ENTRY_K_STRUCT=ENTRY_K_STRUCT,
+        ENTRY_USE_ASYM=ENTRY_USE_ASYM,
+        ENTRY_N_DOWN=ENTRY_N_DOWN,
+    )
 
-        ultima = df_valid.iloc[-1]
-        senal = ultima["Momentum Signal"]
-        fecha = ultima["Open time"]
+    sig = simulate_sellraw_only(d, buy_ok)
 
-        # estilos por señal
-        if senal == "BUY":
-            bg, color, emoji = "#90EE90", "#000", "🟢"
-        elif senal == "SELL":
-            bg, color, emoji = "#FF7F7F", "#FFF", "🔴"
-        else:
-            bg, color, emoji = "#D3D3D3", "#000", "⏸️"
+    ts_last = sig.index.max()
+    if pd.isna(ts_last):
+        st.error("No se pudo determinar la última vela (ts_last es NaT).")
+        st.stop()
 
-        st.markdown(f"""
-        <div style="background:{bg};color:{color};
-            padding:12px;border-radius:10px;margin-bottom:10px;">
-            <b>{symbol}</b> {emoji} {senal}<br>
-            <small>{fecha}</small>
-        </div>
-        """, unsafe_allow_html=True)
-
-    except Exception as e:
-        st.error(f"Error procesando {symbol}: {e}")
-
+except Exception as e:
+    st.error(f"Error cargando/procesando BTCUSDT: {e}")
+    st.stop()
 
 # ==============================
-# 📊 GRÁFICOS
+# HEADER / STATUS
 # ==============================
-st.markdown("### 📊 Gráficos de Señales (últimas 180 velas)")
+row = sig.loc[ts_last]
+curr = "BUY" if bool(row.get("BUY", False)) else "SELL" if bool(row.get("SELL", False)) else "NONE"
+btc_price = float(d.loc[ts_last, "Close"])
 
-MAX_VELAS = 180
-
-for symbol in symbols:
-    try:
-        df = procesar_symbol(symbol)
-        dff = df.tail(MAX_VELAS).copy()
-
-        if dff.empty:
-            st.warning(f"No hay datos recientes para {symbol}.")
-            continue
-
-        # evitar warnings pandas
-        dff = dff.copy()
-        dff.loc[:, "prev"] = dff["Momentum Signal"].shift(1)
-
-        buys = dff[(dff["Momentum Signal"] == "BUY") & (dff["prev"] != "BUY")]
-        sells = dff[(dff["Momentum Signal"] == "SELL") & (dff["prev"] != "SELL")]
-
-        fig = go.Figure()
-
-        # --- Candlesticks ---
-        fig.add_trace(go.Candlestick(
-            name=f"{symbol} Price",
-            x=dff['Open time'],
-            open=dff['Open'], high=dff['High'],
-            low=dff['Low'], close=dff['Close']
-        ))
-
-        # --- Señales ---
-        fig.add_trace(go.Scatter(
-            name="BUY",
-            x=buys["Open time"],
-            y=buys["Low"] * 0.999,
-            mode="text",
-            text="🟢 BUY",
-            showlegend=False        # 👈 oculta del legend
-        ))
-
-        fig.add_trace(go.Scatter(
-            name="SELL",
-            x=sells["Open time"],
-            y=sells["High"] * 1.001,
-            mode="text",
-            text="🔴 SELL",
-            showlegend=False        # 👈 oculta del legend
-        ))
-
-
-        # --- Crosshair estilo TradingView ---
-        fig.update_layout(
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-            height=480,
-            title=f"{symbol} — Señales 5m (últimas {MAX_VELAS} velas)",
-            hovermode="x unified",
-            xaxis=dict(
-                showspikes=True, spikemode="across",
-                spikesnap="cursor", spikethickness=1,
-                spikecolor="#888", showline=True
-            ),
-            yaxis=dict(
-                showspikes=True, spikemode="across",
-                spikesnap="cursor", spikethickness=1,
-                spikecolor="#888", showline=True
-            )
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error graficando {symbol}: {e}")
-
+st.markdown("### 🧠 Estado actual (última vela cerrada)")
+st.write(f"🕒 **{ts_last}**  |  💵 **BTC Close:** `{btc_price:,.2f}`  |  🎯 **Señal (simulada):** `{curr}`")
 
 # ==============================
-# 📈 TRADINGVIEW
+# CONDITION CARDS (BTC only)
+# ==============================
+st.markdown("### ✅ Condiciones para ejecutar BUY (Champion)")
+
+zspeed = float(d.loc[ts_last, "zspeed"])
+zaccel = float(d.loc[ts_last, "zaccel"])
+zenergy = float(d.loc[ts_last, "zenergy"])
+energy = float(d.loc[ts_last, "energy"])
+struct_score = float(d.loc[ts_last, "struct_score"])
+buy_raw = bool(d.loc[ts_last, "buy_raw"])
+
+thr_eff = float(struct_modulated_threshold(d.loc[[ts_last]], ENTRY_ZENERGY_MIN, ENTRY_K_STRUCT).iloc[0])
+
+gate_ok = (zaccel >= float(P["zaccel_gate"]))
+energy_ok = (energy > 0)
+zenergy_ok = (zenergy >= thr_eff)
+
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    status_card(
+        "1) buy_raw",
+        "OK" if buy_raw else "NO",
+        buy_raw,
+        f"Regla base (zspeed prev<0, zspeed>{P['zspeed_min']}, zaccel>{P['zaccel_min']})"
+    )
+
+with c2:
+    status_card(
+        "2) zaccel gate",
+        f"{zaccel:.3f} ≥ {P['zaccel_gate']}",
+        gate_ok,
+        "Gate fuerte de aceleración"
+    )
+
+with c3:
+    status_card(
+        "3) energy > 0",
+        f"{energy:.6f}",
+        energy_ok,
+        "energy = speed_smooth × accel_smooth"
+    )
+
+with c4:
+    status_card(
+        "4) zenergy ≥ thr_eff",
+        f"{zenergy:.3f} ≥ {thr_eff:.3f}",
+        zenergy_ok,
+        f"struct_score={struct_score:.3f} | base={ENTRY_ZENERGY_MIN} k={ENTRY_K_STRUCT}"
+    )
+
+# ==============================
+# BTC CHART ONLY
+# ==============================
+st.markdown("### 📊 BTCUSDT — Señales Winner/Champion (últimas velas)")
+
+plot_sig = sig.tail(MAX_VELAS).copy()
+plot_d = d.loc[plot_sig.index].copy()
+
+plot_sig["prev_buy"] = plot_sig["BUY"].shift(1).fillna(False)
+plot_sig["prev_sell"] = plot_sig["SELL"].shift(1).fillna(False)
+
+buys = plot_sig[(plot_sig["BUY"]) & (~plot_sig["prev_buy"])]
+sells = plot_sig[(plot_sig["SELL"]) & (~plot_sig["prev_sell"])]
+
+fig = go.Figure()
+
+fig.add_trace(go.Candlestick(
+    name="BTC Price",
+    x=plot_d.index,
+    open=plot_d["Open"], high=plot_d["High"],
+    low=plot_d["Low"], close=plot_d["Close"]
+))
+
+fig.add_trace(go.Scatter(
+    name="BUY",
+    x=buys.index,
+    y=plot_d.loc[buys.index, "Low"] * 0.999,
+    mode="text",
+    text="🟢 BUY",
+    showlegend=False
+))
+
+fig.add_trace(go.Scatter(
+    name="SELL",
+    x=sells.index,
+    y=plot_d.loc[sells.index, "High"] * 1.001,
+    mode="text",
+    text="🔴 SELL",
+    showlegend=False
+))
+
+fig.update_layout(
+    template="plotly_dark",
+    xaxis_rangeslider_visible=False,
+    height=560,
+    title=f"BTCUSDT — Winner/Champion (últimas {min(MAX_VELAS, len(plot_sig))} velas)",
+    hovermode="x unified",
+    xaxis=dict(
+        showspikes=True, spikemode="across",
+        spikesnap="cursor", spikethickness=1,
+        spikecolor="#888", showline=True
+    ),
+    yaxis=dict(
+        showspikes=True, spikemode="across",
+        spikesnap="cursor", spikethickness=1,
+        spikecolor="#888", showline=True
+    )
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ==============================
+# TRADINGVIEW (KEEP)
 # ==============================
 st.markdown("### BTCUSDT — TradingView")
 components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
 width="100%" height="500"></iframe>
 """, height=500)
-
