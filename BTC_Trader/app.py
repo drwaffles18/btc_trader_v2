@@ -4,6 +4,8 @@ import numpy as np
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
+import time
+import pytz
 
 from utils.load_from_sheets import load_symbol_df
 
@@ -21,11 +23,14 @@ from utils.strategy_winner_champion import (
 st.set_page_config(page_title="BTCUSDT — Winner/Champion (5m)", layout="wide")
 st.title("📊 BTCUSDT — Winner/Champion (5m)")
 
-# Auto refresh cada 5 minutos
-st_autorefresh(interval=300000, key="auto_refresh_5m")
+# Auto refresh cada 60s (mejor para “vivir pegado” a Sheets sin esperar 5min)
+# Si prefieres 120s, cámbialo.
+st_autorefresh(interval=60_000, key="auto_refresh_60s")
 
 SYMBOL = "BTCUSDT"
-MAX_VELAS = 220  # ajusta si quieres
+MAX_VELAS = 220
+
+CR = pytz.timezone("America/Costa_Rica")
 
 # ==============================
 # PARÁMETROS (igual que alert_bot)
@@ -54,10 +59,8 @@ ENTRY_N_DOWN      = 1
 # UI helpers
 # ==============================
 def status_card(title: str, value: str, ok: bool, subtitle: str = ""):
-    # ✅ verde con letra blanca | ❌ rojo con letra blanca (como pediste)
     bg = "#198754" if ok else "#dc3545"
     fg = "#ffffff"
-
     glow = "0 0 10px rgba(25,135,84,0.7)" if ok else "0 0 10px rgba(220,53,69,0.6)"
 
     st.markdown(
@@ -88,30 +91,33 @@ def status_card(title: str, value: str, ok: bool, subtitle: str = ""):
         unsafe_allow_html=True
     )
 
-@st.cache_data(ttl=240)
-def load_btc_df() -> pd.DataFrame:
-    df = load_symbol_df(SYMBOL).copy()
-    return df
+# ==============================
+# Helpers (time + load)
+# ==============================
+def _expected_last_close_local(now_local: pd.Timestamp) -> pd.Timestamp:
+    """
+    Última vela cerrada esperada, en tz local:
+      close = floor_5m(now) - 1ms
+    """
+    floor_5m = now_local.floor("5min")
+    return floor_5m - pd.Timedelta(milliseconds=1)
 
 def prep_ohlcv_for_strategy(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normaliza DF de Sheets → OHLCV indexado por tiempo y numérico.
-    La estrategia solo requiere: Open, High, Low, Close, Volume.
+    Preferimos index por Close time (vela cerrada REAL).
     """
     d = df.copy()
 
-    # Elegir columna de tiempo para index (preferimos Open time)
-    if "Open time" in d.columns:
-        d["Open time"] = pd.to_datetime(d["Open time"], errors="coerce")
-        d = d.dropna(subset=["Open time"]).sort_values("Open time").set_index("Open time")
-    elif "Close time" in d.columns:
+    if "Close time" in d.columns:
         d["Close time"] = pd.to_datetime(d["Close time"], errors="coerce")
         d = d.dropna(subset=["Close time"]).sort_values("Close time").set_index("Close time")
+    elif "Open time" in d.columns:
+        d["Open time"] = pd.to_datetime(d["Open time"], errors="coerce")
+        d = d.dropna(subset=["Open time"]).sort_values("Open time").set_index("Open time")
     else:
-        # sin tiempo, igual intentamos pero el chart quedará raro
         d = d.reset_index(drop=True)
 
-    # Numéricos
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
@@ -122,11 +128,71 @@ def prep_ohlcv_for_strategy(df: pd.DataFrame) -> pd.DataFrame:
 
     return d
 
+def _load_btc_df_once() -> pd.DataFrame:
+    return load_symbol_df(SYMBOL).copy()
+
+def wait_for_sheet_fresh(max_wait_sec: int = 45, poll_every_sec: int = 6) -> pd.DataFrame:
+    """
+    Espera a que Sheets tenga la última vela cerrada esperada (según hora local CR),
+    o hasta timeout, devolviendo lo mejor disponible.
+    """
+    t0 = time.time()
+    last_df = None
+    last_ts = None
+
+    while True:
+        df_raw = _load_btc_df_once()
+        last_df = df_raw
+
+        try:
+            d = prep_ohlcv_for_strategy(df_raw)
+            ts_last = d.index.max()
+            last_ts = ts_last
+        except Exception:
+            ts_last = None
+
+        now_local = pd.Timestamp.now(tz=CR)
+        expected = _expected_last_close_local(now_local)
+
+        # Si ya tenemos una vela cerrada >= expected, estamos al día
+        if ts_last is not None and pd.notna(ts_last) and ts_last >= expected:
+            return last_df
+
+        waited = int(time.time() - t0)
+        if waited >= max_wait_sec:
+            # timeout: devolvemos lo mejor que tenemos (aunque sea 1 vela atrás)
+            return last_df
+
+        time.sleep(poll_every_sec)
+
 # ==============================
-# LOAD + STRATEGY
+# Cache (para performance)
+# ==============================
+@st.cache_data(ttl=180)
+def load_btc_df_cached() -> pd.DataFrame:
+    """
+    Cache para no golpear Sheets todo el tiempo.
+    180s porque tu incremental llega ~:20–:40; y el autorefresh está en 60s.
+    """
+    return _load_btc_df_once()
+
+# ==============================
+# LOAD con "freshness gate"
+# ==============================
+with st.spinner("⏳ Sincronizando con Sheets (esperando vela cerrada)..."):
+    # 1) Intentamos esperar un poco por la vela cerrada más reciente.
+    #    Esto reduce el 99% de casos "una vela atrás".
+    df_raw_fresh = wait_for_sheet_fresh(max_wait_sec=45, poll_every_sec=6)
+
+# 2) Para el gráfico, podemos usar el DF fresh (ya que lo tenemos) y además meterlo al flujo.
+#    Si prefieres performance extrema, podrías usar cached aquí. Pero como ya hicimos wait/poll,
+#    lo mejor es usar el fresh en todo el app.
+df_raw = df_raw_fresh.copy()
+
+# ==============================
+# STRATEGY
 # ==============================
 try:
-    df_raw = load_btc_df()
     df = prep_ohlcv_for_strategy(df_raw)
 
     d = build_features_winner(
@@ -165,8 +231,20 @@ row = sig.loc[ts_last]
 curr = "BUY" if bool(row.get("BUY", False)) else "SELL" if bool(row.get("SELL", False)) else "NONE"
 btc_price = float(d.loc[ts_last, "Close"])
 
+# Mostrar en hora CR
+ts_last_local = pd.Timestamp(ts_last).tz_convert(CR) if getattr(ts_last, "tzinfo", None) else pd.Timestamp(ts_last).tz_localize(CR)
+
 st.markdown("### 🧠 Estado actual (última vela cerrada)")
-st.write(f"🕒 **{ts_last}**  |  💵 **BTC Close:** `{btc_price:,.2f}`  |  🎯 **Señal (simulada):** `{curr}`")
+st.write(f"🕒 **{ts_last_local}**  |  💵 **BTC Close:** `{btc_price:,.2f}`  |  🎯 **Señal (simulada):** `{curr}`")
+
+# Debug pequeño (opcional)
+with st.expander("🔎 Debug (Sheets sync)"):
+    now_local = pd.Timestamp.now(tz=CR)
+    expected = _expected_last_close_local(now_local)
+    st.write(f"Ahora (CR): {now_local}")
+    st.write(f"Expected last close (CR): {expected}")
+    st.write(f"ts_last (CR): {ts_last_local}")
+    st.write(f"Delta: {ts_last_local - expected}")
 
 # ==============================
 # CONDITION CARDS (BTC only)
@@ -226,16 +304,13 @@ with c4:
 st.markdown("### 🧭 Radar de Momentum BTC (0–100)")
 
 def _sigmoid_score(x: float) -> float:
-    # 0..100, suave, robusto
     return float(100.0 / (1.0 + np.exp(-x)))
 
-# Scores (0..100)
 score_speed = _sigmoid_score(zspeed)
 score_accel = _sigmoid_score(zaccel)
 score_energy = _sigmoid_score(zenergy)
 score_struct = float(np.clip(struct_score, 0, 1) * 100.0)
 
-# Readiness (0..4)
 readiness = int(buy_raw) + int(gate_ok) + int(energy_ok) + int(zenergy_ok)
 
 r1, r2, r3, r4 = st.columns([1.1, 1.1, 1.1, 1.6])
@@ -253,13 +328,9 @@ radar_df = pd.DataFrame({
     "factor": ["Momentum Speed", "Momentum Accel", "Energy (z)", "Structure"],
     "score":  [score_speed, score_accel, score_energy, score_struct],
     "raw":    [zspeed, zaccel, zenergy, struct_score],
-})
-
-# Orden bonito (arriba→abajo)
-radar_df = radar_df.iloc[::-1].reset_index(drop=True)
+}).iloc[::-1].reset_index(drop=True)
 
 fig_radar = go.Figure()
-
 fig_radar.add_trace(go.Bar(
     x=radar_df["score"],
     y=radar_df["factor"],
@@ -267,7 +338,6 @@ fig_radar.add_trace(go.Bar(
     text=[f"{v:.0f}" for v in radar_df["score"]],
     textposition="outside",
 ))
-
 fig_radar.update_layout(
     template="plotly_dark",
     height=260,
@@ -275,10 +345,8 @@ fig_radar.update_layout(
     xaxis=dict(range=[0, 110], title="Score"),
     yaxis=dict(title=""),
 )
-
 st.plotly_chart(fig_radar, use_container_width=True)
 
-# (Opcional) lista rápida de qué falta para BUY
 missing = []
 if not buy_raw: missing.append("buy_raw")
 if not gate_ok: missing.append("zaccel gate")
@@ -305,14 +373,12 @@ buys = plot_sig[(plot_sig["BUY"]) & (~plot_sig["prev_buy"])]
 sells = plot_sig[(plot_sig["SELL"]) & (~plot_sig["prev_sell"])]
 
 fig = go.Figure()
-
 fig.add_trace(go.Candlestick(
     name="BTC Price",
     x=plot_d.index,
     open=plot_d["Open"], high=plot_d["High"],
     low=plot_d["Low"], close=plot_d["Close"]
 ))
-
 fig.add_trace(go.Scatter(
     name="BUY",
     x=buys.index,
@@ -321,7 +387,6 @@ fig.add_trace(go.Scatter(
     text="🟢 BUY",
     showlegend=False
 ))
-
 fig.add_trace(go.Scatter(
     name="SELL",
     x=sells.index,
@@ -330,7 +395,6 @@ fig.add_trace(go.Scatter(
     text="🔴 SELL",
     showlegend=False
 ))
-
 fig.update_layout(
     template="plotly_dark",
     xaxis_rangeslider_visible=False,
@@ -348,7 +412,6 @@ fig.update_layout(
         spikecolor="#888", showline=True
     )
 )
-
 st.plotly_chart(fig, use_container_width=True)
 
 # ==============================
@@ -359,6 +422,3 @@ components.html("""
 <iframe src="https://www.tradingview.com/embed-widget/advanced-chart/?symbol=BINANCE:BTCUSDT&interval=240&theme=dark"
 width="100%" height="500"></iframe>
 """, height=500)
-
-
-
