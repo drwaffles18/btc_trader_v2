@@ -480,37 +480,59 @@ def main():
         # 6) Ejecutar/enviar
         if debe_enviar:
             emoji = "🟢" if signal == "BUY" else "🔴"
-
+        
             mensaje = (
                 f"{emoji} {signal} TRIGGER {symbol} → TRADE {TRADE_SYMBOL}\n"
                 f"📌 Trigger price ({symbol}): {btc_price:,.4f}\n"
             )
             if bnb_price is not None:
                 mensaje += f"💰 Trade price ({TRADE_SYMBOL}): {bnb_price:,.4f}\n"
-
+        
             ts_cr = ts.tz_convert(CR)
             mensaje += (
                 f"🕒 {ts_cr.isoformat()}\n"
                 f"⚙️ winner: zaccel_gate={P['zaccel_gate']} zenergy_min={ENTRY_ZENERGY_MIN} k_struct={ENTRY_K_STRUCT}\n"
             )
-
+        
             enviar_mensaje_telegram(mensaje)
-
+        
+            trade_result = {
+                "status": "NOT_ATTEMPTED",
+                "executed": False,
+                "error": None,
+            }
+        
             try:
                 trade_result = route_signal({
-                        "symbol": TRADE_SYMBOL,
-                        "side": signal,
-                        "context": {
-                            "ts": str(ts),
-                            "btc_price": btc_price,
-                            "bnb_price": bnb_price,
-                        }
-                    })
+                    "symbol": TRADE_SYMBOL,
+                    "side": signal,
+                    "context": {
+                        "ts": str(ts),
+                        "btc_price": btc_price,
+                        "bnb_price": bnb_price,
+                    }
+                })
                 print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado {signal}: {trade_result}", flush=True)
             except Exception as e:
+                trade_result = {
+                    "status": "ERROR",
+                    "executed": False,
+                    "error": str(e),
+                }
                 print(f"⚠️ [TRADE {TRADE_SYMBOL}] Error {signal} (route_signal): {e}", flush=True)
-
-            estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
+        
+            # ✅ SOLO commit del estado si el trade realmente se ejecutó
+            if bool(trade_result.get("executed", False)) and trade_result.get("status") == "OK":
+                estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
+                print(f"✅ [STATE] Commit de estado por ejecución real: {signal}", flush=True)
+            else:
+                # avanzamos la vela, pero NO consumimos la señal como ejecutada
+                estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
+                print(
+                    f"⚠️ [STATE] Sin commit de señal. "
+                    f"trade_result.status={trade_result.get('status')} executed={trade_result.get('executed')}",
+                    flush=True
+                )
         else:
             estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
 
