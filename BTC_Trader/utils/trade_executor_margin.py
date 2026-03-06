@@ -1,11 +1,15 @@
 # =============================================================
 # utils/trade_executor_margin.py
-# 🟣 Cross Margin Executor (BNB-only) — SAFE IMPORT
+# 🟣 Cross Margin Executor (BNB-only) — ATOMIC / SAFE IMPORT
 # -------------------------------------------------------------
 # - NO calls Binance en import
 # - Usa get_client() SOLO dentro
 # - Ban-guard para -1003
 # - Para equity BTC→USDT usa btc_price de context (Sheets) si existe
+# - BUY robusto:
+#     borrow -> poll balance -> buy con colchón -> log -> return canónico
+# - Si BUY falla tras borrow, intenta repay inmediato
+# - Registra también errores/rechazos en Sheets
 # =============================================================
 
 import os
@@ -16,7 +20,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional
 
 from utils.google_client import get_gsheet_client
-from utils.binance_session import get_client  # <- tu sesión ya creada
+from utils.binance_session import get_client
 
 # =============================================================
 # 0) ENV
@@ -33,6 +37,11 @@ MIN_MARGIN_LEVEL  = float(os.getenv("MIN_MARGIN_LEVEL", "1.50"))
 
 BINANCE_NOTIONAL_FLOOR = float(os.getenv("BINANCE_NOTIONAL_FLOOR", "5.0"))
 SAFE_NOTIONAL_FACTOR   = float(os.getenv("SAFE_NOTIONAL_FACTOR", "0.9995"))
+
+# colchón adicional post-borrow / pre-buy
+POST_BORROW_BUY_BUFFER = float(os.getenv("POST_BORROW_BUY_BUFFER", "0.9975"))
+POST_BORROW_POLL_TRIES = int(os.getenv("POST_BORROW_POLL_TRIES", "8"))
+POST_BORROW_POLL_SLEEP = float(os.getenv("POST_BORROW_POLL_SLEEP", "0.75"))
 
 GSHEET_ID = (os.getenv("GOOGLE_SHEET_ID") or "").strip()
 
@@ -83,9 +92,17 @@ def _get_ws_trades():
         return None
 
 def _append_trade_row(row: Dict[str, Any]) -> None:
+    """
+    Mantiene tu esquema actual:
+    trade_id, symbol, side, qty, entry_price, entry_time, exit_price, exit_time,
+    profit_usdt, status, trade_mode
+
+    Para errores, metemos el detalle dentro de status.
+    """
     ws = _get_ws_trades()
     if ws is None:
         return
+
     values = [[
         row.get("trade_id", ""),
         row.get("symbol", ""),
@@ -105,7 +122,7 @@ def _append_trade_row(row: Dict[str, Any]) -> None:
         print(f"⚠️ [MARGIN] append_rows falló: {e}", flush=True)
 
 # =============================================================
-# 3) Helpers numéricos
+# 3) Helpers numéricos / resultado canónico
 # =============================================================
 
 def _round_usdt_2(x: float) -> float:
@@ -113,6 +130,51 @@ def _round_usdt_2(x: float) -> float:
 
 def _round_6(x: float) -> float:
     return float(Decimal(str(x)).quantize(Decimal("1.000000"), rounding=ROUND_DOWN))
+
+def _utcnow_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+def _make_trade_id(symbol: str) -> str:
+    return f"{symbol}_{datetime.utcnow().timestamp()}"
+
+def _trade_row_base(
+    trade_id: str,
+    symbol: str,
+    side: str,
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": "",
+        "entry_price": context.get("bnb_price", ""),
+        "entry_time": _utcnow_iso(),
+        "exit_price": "",
+        "exit_time": "",
+        "profit_usdt": "",
+        "status": "",
+        "trade_mode": "MARGIN",
+    }
+
+def _result(
+    status: str,
+    executed: bool,
+    order: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    trade_id: Optional[str] = None,
+    detail: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = {
+        "status": status,
+        "executed": executed,
+        "order": order,
+        "error": error,
+        "trade_id": trade_id,
+    }
+    if detail:
+        out.update(detail)
+    return out
 
 # =============================================================
 # 4) BINANCE MARGIN HELPERS (solo en ejecución)
@@ -142,17 +204,12 @@ def _get_margin_free_asset(client, asset: str) -> float:
     return 0.0
 
 def _get_margin_equity_usdt(client, btc_price_from_context: Optional[float]) -> float:
-    """
-    Equity en USDT = totalNetAssetOfBtc * BTCUSDT.
-    Para NO pedir precio a Binance, usamos btc_price_from_context (Sheets).
-    """
     acc = _get_margin_account(client)
     btc_equity = float(acc.get("totalNetAssetOfBtc", 0) or 0)
 
     if btc_price_from_context and btc_price_from_context > 0:
         return btc_equity * float(btc_price_from_context)
 
-    # Fallback (si no pasas btc_price): usar ticker Binance (1 request)
     t = client.get_symbol_ticker(symbol="BTCUSDT")
     btc_price = float(t.get("price", 0) or 0)
     return btc_equity * btc_price
@@ -172,7 +229,6 @@ def _round_step(value: float, step: float) -> float:
     dec_val = Decimal(str(value))
     dec_step = Decimal(str(step))
     rounded = (dec_val // dec_step) * dec_step
-    # aproximación decimales
     precision = int(round(-math.log(step, 10), 0)) if step < 1 else 0
     if precision > 0:
         return float(rounded.quantize(Decimal(f"1e-{precision}"), rounding=ROUND_DOWN))
@@ -185,15 +241,21 @@ def _borrow_usdt_if_needed(client, required_usdt: float) -> Dict[str, Any]:
     print(f"💳 [MARGIN] free_usdt={free:.6f} required={required_usdt:.6f} missing={missing:.6f}", flush=True)
 
     if missing <= 0.0:
-        return {"status": "NO_BORROW"}
+        return {"status": "NO_BORROW", "amount": 0.0, "free_before": free}
 
     missing_clean = _round_6(missing)
 
     if DRY_RUN:
         print(f"💤 [MARGIN] DRY_RUN borrow USDT {missing_clean}", flush=True)
-        return {"status": "DRY_RUN_BORROW", "amount": missing_clean}
+        return {"status": "DRY_RUN_BORROW", "amount": missing_clean, "free_before": free}
 
-    return client.create_margin_loan(asset="USDT", amount=str(missing_clean))
+    res = client.create_margin_loan(asset="USDT", amount=str(missing_clean))
+    return {
+        "status": "BORROWED",
+        "amount": missing_clean,
+        "free_before": free,
+        "response": res,
+    }
 
 def _repay_all_usdt(client) -> Dict[str, Any]:
     acc = _get_margin_account(client)
@@ -216,6 +278,20 @@ def _repay_all_usdt(client) -> Dict[str, Any]:
         return {"status": "DRY_RUN_REPAY", "debt": debt_clean}
 
     return client.repay_margin_loan(asset="USDT", amount=str(debt_clean))
+
+def _wait_margin_free_usdt(client, min_required: float, tries: int, sleep_s: float) -> float:
+    """
+    Poll post-borrow hasta ver balance suficiente o devolver el máximo visible.
+    """
+    best = 0.0
+    for i in range(1, tries + 1):
+        free = _get_margin_free_usdt(client)
+        best = max(best, free)
+        print(f"⏳ [MARGIN] balance check {i}/{tries} → free_usdt={free:.6f} required={min_required:.6f}", flush=True)
+        if free >= min_required:
+            return free
+        time.sleep(sleep_s)
+    return best
 
 def _margin_buy_quote(client, symbol: str, quote_usdt: float) -> Dict[str, Any]:
     if DRY_RUN:
@@ -252,37 +328,44 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
 
     print(f"\n========== 🟣 MARGIN {side} {symbol} ==========", flush=True)
 
-    # Guardrail single-asset
     if STRICT_TRADE_SYMBOL and symbol != TRADE_SYMBOL:
         print(f"⛔ [MARGIN] IGNORE → {symbol} != TRADE_SYMBOL {TRADE_SYMBOL}", flush=True)
-        return {"status": "IGNORED_SYMBOL", "symbol": symbol, "trade_symbol": TRADE_SYMBOL}
+        return _result("IGNORED_SYMBOL", executed=False, detail={"symbol": symbol, "trade_symbol": TRADE_SYMBOL})
 
-    # Ban guard
     if _ban_active():
         print(f"⛔ [MARGIN] BANNED_ACTIVE until_ms={_BANNED_UNTIL_MS}", flush=True)
-        return {"status": "BANNED", "until_ms": _BANNED_UNTIL_MS}
+        return _result("BANNED", executed=False, detail={"until_ms": _BANNED_UNTIL_MS})
 
-    # Obtener client
     try:
         client = get_client()
+        if client is None:
+            return _result("NO_CLIENT", executed=False, error="get_client() returned None")
     except Exception as e:
         print(f"❌ [MARGIN] No pude obtener client: {e}", flush=True)
-        return {"status": "NO_CLIENT", "error": str(e)}
+        return _result("NO_CLIENT", executed=False, error=str(e))
+
+    trade_id = _make_trade_id(symbol)
+    borrowed = False
 
     try:
         if side == "BUY":
-            # 1) Guardrail risk
+            base_row = _trade_row_base(trade_id, symbol, side, context)
+
+            # 1) Risk check
             mlevel = _get_margin_level(client)
             print(f"📊 [MARGIN] margin_level={mlevel:.2f} (min={MIN_MARGIN_LEVEL})", flush=True)
             if mlevel < MIN_MARGIN_LEVEL:
-                return {"status": "RISK_MARGIN_LEVEL", "margin_level": mlevel}
+                row = {**base_row, "status": f"REJECTED:RISK_MARGIN_LEVEL:{mlevel:.4f}"}
+                _append_trade_row(row)
+                return _result("RISK_MARGIN_LEVEL", executed=False, trade_id=trade_id, detail={"margin_level": mlevel})
 
-            # 2) Equity (USDT) usando BTC price de context (Sheets)
+            # 2) Equity/target
             btc_price = context.get("btc_price", None)
             equity_usdt = _get_margin_equity_usdt(client, btc_price)
-
             if equity_usdt <= 0:
-                return {"status": "NO_MARGIN_COLLATERAL", "equity_usdt": equity_usdt}
+                row = {**base_row, "status": "REJECTED:NO_MARGIN_COLLATERAL"}
+                _append_trade_row(row)
+                return _result("NO_MARGIN_COLLATERAL", executed=False, trade_id=trade_id, detail={"equity_usdt": equity_usdt})
 
             base_target = equity_usdt * float(TRADE_WEIGHT)
             target_notional = base_target * float(MARGIN_MULTIPLIER)
@@ -300,58 +383,134 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
             )
 
             if safe < min_required:
-                return {"status": "TOO_SMALL", "safe": safe, "min_required": min_required}
+                row = {**base_row, "status": f"REJECTED:TOO_SMALL:{safe:.2f}"}
+                _append_trade_row(row)
+                return _result("TOO_SMALL", executed=False, trade_id=trade_id, detail={"safe": safe, "min_required": min_required})
 
-            # 3) Borrow si hace falta
+            # 3) Borrow if needed
             borrow_res = _borrow_usdt_if_needed(client, safe)
-            if str(borrow_res).startswith("{") is False:
-                # create_margin_loan devuelve dict; aquí solo para evitar edge-cases
-                pass
+            borrowed = borrow_res.get("status") in ("BORROWED", "DRY_RUN_BORROW")
 
-            # 4) Ejecutar BUY
-            order = _margin_buy_quote(client, symbol, safe)
+            # 4) Reconcile post-borrow balance and buy with cushion
+            free_after = _wait_margin_free_usdt(
+                client,
+                min_required=safe,
+                tries=POST_BORROW_POLL_TRIES,
+                sleep_s=POST_BORROW_POLL_SLEEP
+            )
 
-            trade_id = f"{symbol}_{datetime.utcnow().timestamp()}"
-            _append_trade_row({
-                "trade_id": trade_id,
-                "symbol": symbol,
-                "side": "BUY",
+            buy_quote = _round_usdt_2(min(safe, free_after * float(POST_BORROW_BUY_BUFFER)))
+
+            print(
+                f"🧱 [MARGIN] free_after={free_after:.6f} "
+                f"buy_quote={buy_quote:.2f} buffer={POST_BORROW_BUY_BUFFER}",
+                flush=True
+            )
+
+            if buy_quote < min_required:
+                # si hubo borrow pero no quedó balance suficiente, intentamos cleanup
+                if borrowed:
+                    try:
+                        _repay_all_usdt(client)
+                    except Exception as repay_err:
+                        print(f"⚠️ [MARGIN] repay tras BUY fallido (pre-order) falló: {repay_err}", flush=True)
+
+                row = {**base_row, "status": f"ERROR:INSUFFICIENT_POST_BORROW_BALANCE:{buy_quote:.2f}"}
+                _append_trade_row(row)
+                return _result(
+                    "ERROR",
+                    executed=False,
+                    error="Insufficient post-borrow balance",
+                    trade_id=trade_id,
+                    detail={"buy_quote": buy_quote, "min_required": min_required}
+                )
+
+            # 5) Place BUY
+            order = _margin_buy_quote(client, symbol, buy_quote)
+
+            row = {
+                **base_row,
                 "qty": float(order.get("executedQty", 0) or 0),
-                "entry_price": context.get("bnb_price", ""),
-                "entry_time": datetime.utcnow().isoformat(),
-                "exit_price": "",
-                "exit_time": "",
-                "profit_usdt": "",
+                "entry_time": _utcnow_iso(),
                 "status": "OPEN",
-                "trade_mode": "MARGIN",
-            })
+            }
+            _append_trade_row(row)
 
-            return {"status": "OK", "order": order}
+            return _result(
+                "OK",
+                executed=True,
+                order=order,
+                trade_id=trade_id,
+                detail={"buy_quote": buy_quote}
+            )
 
         elif side == "SELL":
+            base_row = _trade_row_base(trade_id, symbol, side, context)
             asset = symbol.replace("USDT", "").strip()
             qty_avail = _get_margin_free_asset(client, asset)
             print(f"ℹ️ [MARGIN] {asset} free≈{qty_avail:.8f}", flush=True)
+
             if qty_avail <= 0:
-                _repay_all_usdt(client)
-                return {"status": "NO_POSITION_MARGIN"}
+                try:
+                    _repay_all_usdt(client)
+                except Exception as repay_err:
+                    print(f"⚠️ [MARGIN] repay on NO_POSITION failed: {repay_err}", flush=True)
+                row = {**base_row, "status": "REJECTED:NO_POSITION_MARGIN"}
+                _append_trade_row(row)
+                return _result("NO_POSITION_MARGIN", executed=False, trade_id=trade_id)
 
             filters = _get_symbol_filters(client, symbol)
             qty_clean = _round_step(qty_avail, filters["step"])
 
             if qty_clean <= 0:
-                return {"status": "INVALID_QTY", "qty_avail": qty_avail, "qty_clean": qty_clean}
+                row = {**base_row, "status": f"REJECTED:INVALID_QTY:{qty_avail}"}
+                _append_trade_row(row)
+                return _result(
+                    "INVALID_QTY",
+                    executed=False,
+                    trade_id=trade_id,
+                    detail={"qty_avail": qty_avail, "qty_clean": qty_clean}
+                )
 
             order = _margin_sell_qty(client, symbol, qty_clean)
 
-            # Repagar deuda
-            _repay_all_usdt(client)
+            try:
+                _repay_all_usdt(client)
+            except Exception as repay_err:
+                print(f"⚠️ [MARGIN] repay tras SELL falló: {repay_err}", flush=True)
 
-            return {"status": "OK", "order": order}
+            row = {
+                **base_row,
+                "qty": float(order.get("executedQty", 0) or 0),
+                "entry_time": _utcnow_iso(),
+                "status": "CLOSE",
+            }
+            _append_trade_row(row)
 
-        return {"status": "IGNORED", "detail": "side inválido"}
+            return _result("OK", executed=True, order=order, trade_id=trade_id)
+
+        return _result("IGNORED", executed=False, detail={"detail": "side inválido"})
 
     except Exception as e:
         _mark_banned_from_exception(e)
+
+        # cleanup si el BUY falló después de borrow
+        if side == "BUY" and borrowed:
+            try:
+                _repay_all_usdt(client)
+            except Exception as repay_err:
+                print(f"⚠️ [MARGIN] repay tras excepción BUY falló: {repay_err}", flush=True)
+
         print(f"❌ [MARGIN] Error ejecutando: {e}", flush=True)
-        return {"status": "ERROR", "error": str(e), "banned_until_ms": _BANNED_UNTIL_MS or None}
+
+        err_row = _trade_row_base(trade_id, symbol, side, context)
+        err_row["status"] = f"ERROR:{str(e)[:180]}"
+        _append_trade_row(err_row)
+
+        return _result(
+            "ERROR",
+            executed=False,
+            error=str(e),
+            trade_id=trade_id,
+            detail={"banned_until_ms": _BANNED_UNTIL_MS or None}
+        )
