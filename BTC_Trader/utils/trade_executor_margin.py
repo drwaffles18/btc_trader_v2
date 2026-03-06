@@ -9,7 +9,8 @@
 # - BUY robusto:
 #     borrow -> poll balance -> buy con colchón -> log -> return canónico
 # - Si BUY falla tras borrow, intenta repay inmediato
-# - Registra también errores/rechazos en Sheets
+# - BUY crea fila OPEN en Trades
+# - SELL cierra la última fila OPEN en Trades (no agrega fila nueva normal)
 # =============================================================
 
 import os
@@ -38,7 +39,6 @@ MIN_MARGIN_LEVEL  = float(os.getenv("MIN_MARGIN_LEVEL", "1.50"))
 BINANCE_NOTIONAL_FLOOR = float(os.getenv("BINANCE_NOTIONAL_FLOOR", "5.0"))
 SAFE_NOTIONAL_FACTOR   = float(os.getenv("SAFE_NOTIONAL_FACTOR", "0.9995"))
 
-# colchón adicional post-borrow / pre-buy
 POST_BORROW_BUY_BUFFER = float(os.getenv("POST_BORROW_BUY_BUFFER", "0.9975"))
 POST_BORROW_POLL_TRIES = int(os.getenv("POST_BORROW_POLL_TRIES", "8"))
 POST_BORROW_POLL_SLEEP = float(os.getenv("POST_BORROW_POLL_SLEEP", "0.75"))
@@ -92,13 +92,6 @@ def _get_ws_trades():
         return None
 
 def _append_trade_row(row: Dict[str, Any]) -> None:
-    """
-    Mantiene tu esquema actual:
-    trade_id, symbol, side, qty, entry_price, entry_time, exit_price, exit_time,
-    profit_usdt, status, trade_mode
-
-    Para errores, metemos el detalle dentro de status.
-    """
     ws = _get_ws_trades()
     if ws is None:
         return
@@ -123,10 +116,10 @@ def _append_trade_row(row: Dict[str, Any]) -> None:
 
 def _find_last_open_trade_row(symbol: str, trade_mode: str = "MARGIN") -> Optional[Dict[str, Any]]:
     """
-    Busca la última fila OPEN para el symbol/trade_mode.
-    Retorna dict con:
+    Busca la última fila OPEN para symbol/trade_mode.
+    Retorna:
       {
-        "row_number": int,   # número real de fila en Sheets (incluye header)
+        "row_number": int,
         "trade_id": str,
         "qty": float,
         "entry_price": float,
@@ -146,7 +139,6 @@ def _find_last_open_trade_row(symbol: str, trade_mode: str = "MARGIN") -> Option
     if not records:
         return None
 
-    # records empieza en fila 2 de Sheets
     for idx in range(len(records) - 1, -1, -1):
         r = records[idx]
 
@@ -166,7 +158,7 @@ def _find_last_open_trade_row(symbol: str, trade_mode: str = "MARGIN") -> Option
                 entry_price = 0.0
 
             return {
-                "row_number": idx + 2,  # +2 porque records empieza en fila 2 real
+                "row_number": idx + 2,
                 "trade_id": r.get("trade_id", ""),
                 "qty": qty,
                 "entry_price": entry_price,
@@ -174,42 +166,6 @@ def _find_last_open_trade_row(symbol: str, trade_mode: str = "MARGIN") -> Option
             }
 
     return None
-
-
-def _extract_fill_price(order: Dict[str, Any], fallback_price: Optional[float] = None) -> Optional[float]:
-    """
-    Intenta sacar el precio real de ejecución desde fills.
-    Fallback:
-      cummulativeQuoteQty / executedQty
-      luego fallback_price
-    """
-    try:
-        fills = order.get("fills", []) or []
-        if fills:
-            prices = []
-            qtys = []
-            for f in fills:
-                p = float(f.get("price", 0) or 0)
-                q = float(f.get("qty", 0) or 0)
-                if p > 0 and q > 0:
-                    prices.append(p)
-                    qtys.append(q)
-
-            if prices and qtys and sum(qtys) > 0:
-                return sum(p * q for p, q in zip(prices, qtys)) / sum(qtys)
-    except Exception:
-        pass
-
-    try:
-        cq = float(order.get("cummulativeQuoteQty", 0) or 0)
-        eq = float(order.get("executedQty", 0) or 0)
-        if cq > 0 and eq > 0:
-            return cq / eq
-    except Exception:
-        pass
-
-    return fallback_price
-
 
 def _update_trade_close(
     row_number: int,
@@ -219,36 +175,27 @@ def _update_trade_close(
     status: str = "CLOSED",
 ) -> None:
     """
-    Actualiza la fila OPEN existente en Trades.
-    Columnas esperadas:
-      A trade_id
-      B symbol
-      C side
-      D qty
-      E entry_price
-      F entry_time
+    Actualiza columnas G:J en la fila OPEN existente:
       G exit_price
       H exit_time
       I profit_usdt
       J status
-      K trade_mode
     """
     ws = _get_ws_trades()
     if ws is None:
         return
 
     values = [[
-        "" if exit_price is None else exit_price,   # G
-        exit_time,                                  # H
-        "" if profit_usdt is None else profit_usdt, # I
-        status,                                     # J
+        "" if exit_price is None else exit_price,
+        exit_time,
+        "" if profit_usdt is None else profit_usdt,
+        status,
     ]]
 
     try:
         ws.update(range_name=f"G{row_number}:J{row_number}", values=values)
     except Exception as e:
         print(f"⚠️ [MARGIN] update close row falló en fila {row_number}: {e}", flush=True)
-
 
 # =============================================================
 # 3) Helpers numéricos / resultado canónico
@@ -286,6 +233,40 @@ def _trade_row_base(
         "trade_mode": "MARGIN",
     }
 
+def _extract_fill_price(order: Dict[str, Any], fallback_price: Optional[float] = None) -> Optional[float]:
+    """
+    Intenta sacar el precio real desde fills.
+    Fallback:
+      cummulativeQuoteQty / executedQty
+      luego fallback_price
+    """
+    try:
+        fills = order.get("fills", []) or []
+        if fills:
+            prices = []
+            qtys = []
+            for f in fills:
+                p = float(f.get("price", 0) or 0)
+                q = float(f.get("qty", 0) or 0)
+                if p > 0 and q > 0:
+                    prices.append(p)
+                    qtys.append(q)
+
+            if prices and qtys and sum(qtys) > 0:
+                return sum(p * q for p, q in zip(prices, qtys)) / sum(qtys)
+    except Exception:
+        pass
+
+    try:
+        cq = float(order.get("cummulativeQuoteQty", 0) or 0)
+        eq = float(order.get("executedQty", 0) or 0)
+        if cq > 0 and eq > 0:
+            return cq / eq
+    except Exception:
+        pass
+
+    return fallback_price
+
 def _result(
     status: str,
     executed: bool,
@@ -306,7 +287,7 @@ def _result(
     return out
 
 # =============================================================
-# 4) BINANCE MARGIN HELPERS (solo en ejecución)
+# 4) BINANCE MARGIN HELPERS
 # =============================================================
 
 def _get_margin_account(client) -> Dict[str, Any]:
@@ -409,9 +390,6 @@ def _repay_all_usdt(client) -> Dict[str, Any]:
     return client.repay_margin_loan(asset="USDT", amount=str(debt_clean))
 
 def _wait_margin_free_usdt(client, min_required: float, tries: int, sleep_s: float) -> float:
-    """
-    Poll post-borrow hasta ver balance suficiente o devolver el máximo visible.
-    """
     best = 0.0
     for i in range(1, tries + 1):
         free = _get_margin_free_usdt(client)
@@ -480,7 +458,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
         if side == "BUY":
             base_row = _trade_row_base(trade_id, symbol, side, context)
 
-            # 1) Risk check
             mlevel = _get_margin_level(client)
             print(f"📊 [MARGIN] margin_level={mlevel:.2f} (min={MIN_MARGIN_LEVEL})", flush=True)
             if mlevel < MIN_MARGIN_LEVEL:
@@ -488,7 +465,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 _append_trade_row(row)
                 return _result("RISK_MARGIN_LEVEL", executed=False, trade_id=trade_id, detail={"margin_level": mlevel})
 
-            # 2) Equity/target
             btc_price = context.get("btc_price", None)
             equity_usdt = _get_margin_equity_usdt(client, btc_price)
             if equity_usdt <= 0:
@@ -516,11 +492,9 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 _append_trade_row(row)
                 return _result("TOO_SMALL", executed=False, trade_id=trade_id, detail={"safe": safe, "min_required": min_required})
 
-            # 3) Borrow if needed
             borrow_res = _borrow_usdt_if_needed(client, safe)
             borrowed = borrow_res.get("status") in ("BORROWED", "DRY_RUN_BORROW")
 
-            # 4) Reconcile post-borrow balance and buy with cushion
             free_after = _wait_margin_free_usdt(
                 client,
                 min_required=safe,
@@ -537,7 +511,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
             )
 
             if buy_quote < min_required:
-                # si hubo borrow pero no quedó balance suficiente, intentamos cleanup
                 if borrowed:
                     try:
                         _repay_all_usdt(client)
@@ -554,7 +527,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                     detail={"buy_quote": buy_quote, "min_required": min_required}
                 )
 
-            # 5) Place BUY
             order = _margin_buy_quote(client, symbol, buy_quote)
 
             row = {
@@ -562,6 +534,7 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 "qty": float(order.get("executedQty", 0) or 0),
                 "entry_time": _utcnow_iso(),
                 "status": "OPEN",
+                "trade_mode": "MARGIN",
             }
             _append_trade_row(row)
 
@@ -572,7 +545,7 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 trade_id=trade_id,
                 detail={"buy_quote": buy_quote}
             )
-        #empieza Sell
+
         elif side == "SELL":
             asset = symbol.replace("USDT", "").strip()
             qty_avail = _get_margin_free_asset(client, asset)
@@ -583,7 +556,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                     _repay_all_usdt(client)
                 except Exception as repay_err:
                     print(f"⚠️ [MARGIN] repay on NO_POSITION failed: {repay_err}", flush=True)
-
                 return _result("NO_POSITION_MARGIN", executed=False, trade_id=None)
 
             filters = _get_symbol_filters(client, symbol)
@@ -597,21 +569,17 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                     detail={"qty_avail": qty_avail, "qty_clean": qty_clean}
                 )
 
-            # 1) Buscar trade OPEN antes de vender
             open_trade = _find_last_open_trade_row(symbol=symbol, trade_mode="MARGIN")
             if open_trade is None:
                 print(f"⚠️ [MARGIN] No encontré trade OPEN para cerrar en Sheets ({symbol})", flush=True)
 
-            # 2) Ejecutar SELL real en Binance
             order = _margin_sell_qty(client, symbol, qty_clean)
 
-            # 3) Repagar deuda
             try:
                 _repay_all_usdt(client)
             except Exception as repay_err:
                 print(f"⚠️ [MARGIN] repay tras SELL falló: {repay_err}", flush=True)
 
-            # 4) Calcular exit_price / exit_time / profit
             exit_price = _extract_fill_price(order, fallback_price=context.get("bnb_price"))
             exit_time = _utcnow_iso()
 
@@ -634,7 +602,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                     status="CLOSED",
                 )
             else:
-                # Solo como fallback extremo: si no encontró OPEN, deja registro aparte
                 fallback_trade_id = _make_trade_id(symbol)
                 fallback_row = {
                     "trade_id": fallback_trade_id,
@@ -659,7 +626,6 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
     except Exception as e:
         _mark_banned_from_exception(e)
 
-        # cleanup si el BUY falló después de borrow
         if side == "BUY" and borrowed:
             try:
                 _repay_all_usdt(client)
@@ -670,6 +636,7 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
 
         err_row = _trade_row_base(trade_id, symbol, side, context)
         err_row["status"] = f"ERROR:{str(e)[:180]}"
+        err_row["trade_mode"] = "MARGIN"
         _append_trade_row(err_row)
 
         return _result(
