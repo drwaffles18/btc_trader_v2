@@ -121,6 +121,135 @@ def _append_trade_row(row: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"⚠️ [MARGIN] append_rows falló: {e}", flush=True)
 
+def _find_last_open_trade_row(symbol: str, trade_mode: str = "MARGIN") -> Optional[Dict[str, Any]]:
+    """
+    Busca la última fila OPEN para el symbol/trade_mode.
+    Retorna dict con:
+      {
+        "row_number": int,   # número real de fila en Sheets (incluye header)
+        "trade_id": str,
+        "qty": float,
+        "entry_price": float,
+        "entry_time": str,
+      }
+    """
+    ws = _get_ws_trades()
+    if ws is None:
+        return None
+
+    try:
+        records = ws.get_all_records()
+    except Exception as e:
+        print(f"⚠️ [MARGIN] get_all_records falló buscando OPEN trade: {e}", flush=True)
+        return None
+
+    if not records:
+        return None
+
+    # records empieza en fila 2 de Sheets
+    for idx in range(len(records) - 1, -1, -1):
+        r = records[idx]
+
+        if (
+            str(r.get("symbol", "")).strip().upper() == symbol.upper()
+            and str(r.get("trade_mode", "")).strip().upper() == trade_mode.upper()
+            and str(r.get("status", "")).strip().upper() == "OPEN"
+        ):
+            try:
+                qty = float(r.get("qty", 0) or 0)
+            except Exception:
+                qty = 0.0
+
+            try:
+                entry_price = float(r.get("entry_price", 0) or 0)
+            except Exception:
+                entry_price = 0.0
+
+            return {
+                "row_number": idx + 2,  # +2 porque records empieza en fila 2 real
+                "trade_id": r.get("trade_id", ""),
+                "qty": qty,
+                "entry_price": entry_price,
+                "entry_time": r.get("entry_time", ""),
+            }
+
+    return None
+
+
+def _extract_fill_price(order: Dict[str, Any], fallback_price: Optional[float] = None) -> Optional[float]:
+    """
+    Intenta sacar el precio real de ejecución desde fills.
+    Fallback:
+      cummulativeQuoteQty / executedQty
+      luego fallback_price
+    """
+    try:
+        fills = order.get("fills", []) or []
+        if fills:
+            prices = []
+            qtys = []
+            for f in fills:
+                p = float(f.get("price", 0) or 0)
+                q = float(f.get("qty", 0) or 0)
+                if p > 0 and q > 0:
+                    prices.append(p)
+                    qtys.append(q)
+
+            if prices and qtys and sum(qtys) > 0:
+                return sum(p * q for p, q in zip(prices, qtys)) / sum(qtys)
+    except Exception:
+        pass
+
+    try:
+        cq = float(order.get("cummulativeQuoteQty", 0) or 0)
+        eq = float(order.get("executedQty", 0) or 0)
+        if cq > 0 and eq > 0:
+            return cq / eq
+    except Exception:
+        pass
+
+    return fallback_price
+
+
+def _update_trade_close(
+    row_number: int,
+    exit_price: Optional[float],
+    exit_time: str,
+    profit_usdt: Optional[float],
+    status: str = "CLOSED",
+) -> None:
+    """
+    Actualiza la fila OPEN existente en Trades.
+    Columnas esperadas:
+      A trade_id
+      B symbol
+      C side
+      D qty
+      E entry_price
+      F entry_time
+      G exit_price
+      H exit_time
+      I profit_usdt
+      J status
+      K trade_mode
+    """
+    ws = _get_ws_trades()
+    if ws is None:
+        return
+
+    values = [[
+        "" if exit_price is None else exit_price,   # G
+        exit_time,                                  # H
+        "" if profit_usdt is None else profit_usdt, # I
+        status,                                     # J
+    ]]
+
+    try:
+        ws.update(range_name=f"G{row_number}:J{row_number}", values=values)
+    except Exception as e:
+        print(f"⚠️ [MARGIN] update close row falló en fila {row_number}: {e}", flush=True)
+
+
 # =============================================================
 # 3) Helpers numéricos / resultado canónico
 # =============================================================
@@ -443,9 +572,8 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 trade_id=trade_id,
                 detail={"buy_quote": buy_quote}
             )
-
+        #empieza Sell
         elif side == "SELL":
-            base_row = _trade_row_base(trade_id, symbol, side, context)
             asset = symbol.replace("USDT", "").strip()
             qty_avail = _get_margin_free_asset(client, asset)
             print(f"ℹ️ [MARGIN] {asset} free≈{qty_avail:.8f}", flush=True)
@@ -455,39 +583,76 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                     _repay_all_usdt(client)
                 except Exception as repay_err:
                     print(f"⚠️ [MARGIN] repay on NO_POSITION failed: {repay_err}", flush=True)
-                row = {**base_row, "status": "REJECTED:NO_POSITION_MARGIN"}
-                _append_trade_row(row)
-                return _result("NO_POSITION_MARGIN", executed=False, trade_id=trade_id)
+
+                return _result("NO_POSITION_MARGIN", executed=False, trade_id=None)
 
             filters = _get_symbol_filters(client, symbol)
             qty_clean = _round_step(qty_avail, filters["step"])
 
             if qty_clean <= 0:
-                row = {**base_row, "status": f"REJECTED:INVALID_QTY:{qty_avail}"}
-                _append_trade_row(row)
                 return _result(
                     "INVALID_QTY",
                     executed=False,
-                    trade_id=trade_id,
+                    trade_id=None,
                     detail={"qty_avail": qty_avail, "qty_clean": qty_clean}
                 )
 
+            # 1) Buscar trade OPEN antes de vender
+            open_trade = _find_last_open_trade_row(symbol=symbol, trade_mode="MARGIN")
+            if open_trade is None:
+                print(f"⚠️ [MARGIN] No encontré trade OPEN para cerrar en Sheets ({symbol})", flush=True)
+
+            # 2) Ejecutar SELL real en Binance
             order = _margin_sell_qty(client, symbol, qty_clean)
 
+            # 3) Repagar deuda
             try:
                 _repay_all_usdt(client)
             except Exception as repay_err:
                 print(f"⚠️ [MARGIN] repay tras SELL falló: {repay_err}", flush=True)
 
-            row = {
-                **base_row,
-                "qty": float(order.get("executedQty", 0) or 0),
-                "entry_time": _utcnow_iso(),
-                "status": "CLOSE",
-            }
-            _append_trade_row(row)
+            # 4) Calcular exit_price / exit_time / profit
+            exit_price = _extract_fill_price(order, fallback_price=context.get("bnb_price"))
+            exit_time = _utcnow_iso()
 
-            return _result("OK", executed=True, order=order, trade_id=trade_id)
+            profit_usdt = None
+            trade_id_to_return = None
+
+            if open_trade is not None:
+                entry_price = float(open_trade.get("entry_price", 0) or 0)
+                entry_qty   = float(open_trade.get("qty", 0) or 0)
+                trade_id_to_return = open_trade.get("trade_id")
+
+                if exit_price is not None and entry_price > 0 and entry_qty > 0:
+                    profit_usdt = (float(exit_price) - entry_price) * entry_qty
+
+                _update_trade_close(
+                    row_number=open_trade["row_number"],
+                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    profit_usdt=profit_usdt,
+                    status="CLOSED",
+                )
+            else:
+                # Solo como fallback extremo: si no encontró OPEN, deja registro aparte
+                fallback_trade_id = _make_trade_id(symbol)
+                fallback_row = {
+                    "trade_id": fallback_trade_id,
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "qty": float(order.get("executedQty", 0) or 0),
+                    "entry_price": "",
+                    "entry_time": "",
+                    "exit_price": "" if exit_price is None else exit_price,
+                    "exit_time": exit_time,
+                    "profit_usdt": "" if profit_usdt is None else profit_usdt,
+                    "status": "CLOSED_NO_OPEN_FOUND",
+                    "trade_mode": "MARGIN",
+                }
+                _append_trade_row(fallback_row)
+                trade_id_to_return = fallback_trade_id
+
+            return _result("OK", executed=True, order=order, trade_id=trade_id_to_return)
 
         return _result("IGNORED", executed=False, detail={"detail": "side inválido"})
 
