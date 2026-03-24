@@ -300,7 +300,7 @@ def _utcnow_iso() -> str:
     return datetime.utcnow().isoformat()
 
 def _make_trade_id(symbol: str) -> str:
-    return f"{symbol}_{datetime.utcnow().timestamp()}"
+    return f"{symbol}_{int(time.time() * 1000)}"
 
 def _trade_row_base(
     trade_id: str,
@@ -402,6 +402,39 @@ def _get_margin_free_asset(client, asset: str) -> float:
             return float(a.get("free", 0) or 0)
     return 0.0
 
+def _get_max_borrowable_usdt(client) -> Dict[str, Any]:
+    """
+    Consulta el máximo borrowable REAL de USDT en cross margin.
+
+    Binance expone este dato vía maxBorrowable, y python-binance
+    lo expone como client.get_max_margin_loan(asset="USDT").
+    """
+    details = client.get_max_margin_loan(asset="USDT")
+
+    try:
+        max_borrowable = float(details.get("amount", 0) or 0)
+    except Exception:
+        max_borrowable = 0.0
+
+    try:
+        borrow_limit = float(details.get("borrowLimit", 0) or 0)
+    except Exception:
+        borrow_limit = 0.0
+
+    out = {
+        "max_borrowable": max_borrowable,
+        "borrow_limit": borrow_limit,
+        "raw": details,
+    }
+
+    print(
+        f"🏦 [MARGIN] max_borrowable_usdt={max_borrowable:.6f} "
+        f"borrow_limit={borrow_limit:.6f}",
+        flush=True
+    )
+
+    return out
+
 def _get_margin_equity_usdt(client, btc_price_from_context: Optional[float]) -> float:
     acc = _get_margin_account(client)
     btc_equity = float(acc.get("totalNetAssetOfBtc", 0) or 0)
@@ -437,22 +470,50 @@ def _borrow_usdt_if_needed(client, required_usdt: float) -> Dict[str, Any]:
     free = _get_margin_free_usdt(client)
     missing = max(0.0, required_usdt - free)
 
-    print(f"💳 [MARGIN] free_usdt={free:.6f} required={required_usdt:.6f} missing={missing:.6f}", flush=True)
+    max_borrow_info = _get_max_borrowable_usdt(client)
+    max_borrowable = float(max_borrow_info.get("max_borrowable", 0.0) or 0.0)
+
+    print(
+        f"💳 [MARGIN] free_usdt={free:.6f} required={required_usdt:.6f} "
+        f"missing={missing:.6f} max_borrowable={max_borrowable:.6f}",
+        flush=True
+    )
 
     if missing <= 0.0:
-        return {"status": "NO_BORROW", "amount": 0.0, "free_before": free}
+        return {
+            "status": "NO_BORROW",
+            "amount": 0.0,
+            "free_before": free,
+            "max_borrowable": max_borrowable,
+        }
+
+    # Guardrail duro: nunca intentar pedir más de lo que Binance reporta como máximo
+    if missing - max_borrowable > 1e-9:
+        return {
+            "status": "INSUFFICIENT_BORROW_CAP",
+            "amount": 0.0,
+            "free_before": free,
+            "missing": missing,
+            "max_borrowable": max_borrowable,
+        }
 
     missing_clean = _round_6(missing)
 
     if DRY_RUN:
         print(f"💤 [MARGIN] DRY_RUN borrow USDT {missing_clean}", flush=True)
-        return {"status": "DRY_RUN_BORROW", "amount": missing_clean, "free_before": free}
+        return {
+            "status": "DRY_RUN_BORROW",
+            "amount": missing_clean,
+            "free_before": free,
+            "max_borrowable": max_borrowable,
+        }
 
     res = client.create_margin_loan(asset="USDT", amount=str(missing_clean))
     return {
         "status": "BORROWED",
         "amount": missing_clean,
         "free_before": free,
+        "max_borrowable": max_borrowable,
         "response": res,
     }
 
@@ -767,36 +828,89 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 row = {**base_row, "status": f"REJECTED:RISK_MARGIN_LEVEL:{mlevel:.4f}"}
                 _append_trade_row(row)
                 return _result("RISK_MARGIN_LEVEL", executed=False, trade_id=trade_id, detail={"margin_level": mlevel})
-
+            ## new change starts here
             btc_price = context.get("btc_price", None)
             equity_usdt = _get_margin_equity_usdt(client, btc_price)
             if equity_usdt <= 0:
                 row = {**base_row, "status": "REJECTED:NO_MARGIN_COLLATERAL"}
                 _append_trade_row(row)
-                return _result("NO_MARGIN_COLLATERAL", executed=False, trade_id=trade_id, detail={"equity_usdt": equity_usdt})
+                return _result(
+                    "NO_MARGIN_COLLATERAL",
+                    executed=False,
+                    trade_id=trade_id,
+                    detail={"equity_usdt": equity_usdt}
+                )
+
+            free_usdt = _get_margin_free_usdt(client)
+            max_borrow_info = _get_max_borrowable_usdt(client)
+            max_borrowable = float(max_borrow_info.get("max_borrowable", 0.0) or 0.0)
 
             base_target = equity_usdt * float(TRADE_WEIGHT)
-            target_notional = base_target * float(MARGIN_MULTIPLIER)
+            theoretical_target = base_target * float(MARGIN_MULTIPLIER)
+
+            # Cap real por Binance
+            max_notional_by_borrow = free_usdt + max_borrowable
+
+            # Tamaño final: el menor entre el target teórico y el máximo real permitido
+            capped_target = min(theoretical_target, max_notional_by_borrow)
 
             filters = _get_symbol_filters(client, symbol)
             min_required = max(filters["min_notional"], BINANCE_NOTIONAL_FLOOR)
 
-            clean = _round_usdt_2(target_notional)
+            clean = _round_usdt_2(capped_target)
             safe  = _round_usdt_2(clean * float(SAFE_NOTIONAL_FACTOR))
 
+            capped_by_borrow_limit = theoretical_target > max_notional_by_borrow + 1e-9
+
             print(
-                f"🧮 [MARGIN] equity={equity_usdt:.2f} base_target={base_target:.2f} "
-                f"target≈{target_notional:.2f} clean={clean:.2f} safe={safe:.2f} min={min_required:.2f}",
+                f"🧮 [MARGIN] equity={equity_usdt:.2f} free_usdt={free_usdt:.2f} "
+                f"base_target={base_target:.2f} theoretical≈{theoretical_target:.2f} "
+                f"max_by_borrow≈{max_notional_by_borrow:.2f} capped≈{capped_target:.2f} "
+                f"clean={clean:.2f} safe={safe:.2f} min={min_required:.2f} "
+                f"capped_by_borrow_limit={capped_by_borrow_limit}",
                 flush=True
             )
 
             if safe < min_required:
                 row = {**base_row, "status": f"REJECTED:TOO_SMALL:{safe:.2f}"}
                 _append_trade_row(row)
-                return _result("TOO_SMALL", executed=False, trade_id=trade_id, detail={"safe": safe, "min_required": min_required})
+                return _result(
+                    "TOO_SMALL",
+                    executed=False,
+                    trade_id=trade_id,
+                    detail={
+                        "safe": safe,
+                        "min_required": min_required,
+                        "max_borrowable": max_borrowable,
+                        "free_usdt": free_usdt,
+                    }
+                )
 
             borrow_res = _borrow_usdt_if_needed(client, safe)
             borrowed = borrow_res.get("status") in ("BORROWED", "DRY_RUN_BORROW")
+
+            if borrow_res.get("status") == "INSUFFICIENT_BORROW_CAP":
+                row = {
+                    **base_row,
+                    "status": (
+                        f"REJECTED:INSUFFICIENT_BORROW_CAP:"
+                        f"{borrow_res.get('max_borrowable', 0):.6f}"
+                    )
+                }
+                _append_trade_row(row)
+                return _result(
+                    "INSUFFICIENT_BORROW_CAP",
+                    executed=False,
+                    trade_id=trade_id,
+                    detail={
+                        "free_usdt": free_usdt,
+                        "missing": borrow_res.get("missing"),
+                        "max_borrowable": borrow_res.get("max_borrowable"),
+                        "theoretical_target": theoretical_target,
+                        "capped_target": capped_target,
+                    }
+                )
+            ## ends here
 
             free_after = _wait_margin_free_usdt(
                 client,
@@ -831,23 +945,33 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 )
 
             order = _margin_buy_quote(client, symbol, buy_quote)
+            entry_price_real = _extract_fill_price(order, fallback_price=context.get("bnb_price"))
 
             row = {
                 **base_row,
                 "qty": float(order.get("executedQty", 0) or 0),
+                "entry_price": "" if entry_price_real is None else entry_price_real,
                 "entry_time": _utcnow_iso(),
                 "status": "OPEN",
                 "trade_mode": "MARGIN",
             }
             _append_trade_row(row)
-
+            #
             return _result(
                 "OK",
                 executed=True,
                 order=order,
                 trade_id=trade_id,
-                detail={"buy_quote": buy_quote}
+                detail={
+                    "buy_quote": buy_quote,
+                    "free_usdt": free_usdt,
+                    "max_borrowable": max_borrowable,
+                    "theoretical_target": theoretical_target,
+                    "capped_target": capped_target,
+                    "capped_by_borrow_limit": capped_by_borrow_limit,
+                }
             )
+            #
 
         elif side == "SELL":
             asset = _asset_from_symbol(symbol)
