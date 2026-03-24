@@ -21,7 +21,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional
 
 from utils.google_client import get_gsheet_client
-from utils.binance_session import get_client
+from utils.binance_session import get_client, get_last_init_error
 
 # =============================================================
 # 0) ENV
@@ -446,7 +446,9 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
     try:
         client = get_client()
         if client is None:
-            return _result("NO_CLIENT", executed=False, error="get_client() returned None")
+            init_err = get_last_init_error()
+            print(f"❌ [MARGIN] get_client() returned None | init_err={init_err}", flush=True)
+            return _result("NO_CLIENT", executed=False, error=f"get_client() returned None | init_err={init_err}")
     except Exception as e:
         print(f"❌ [MARGIN] No pude obtener client: {e}", flush=True)
         return _result("NO_CLIENT", executed=False, error=str(e))
