@@ -25,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.load_from_sheets import load_symbol_df
 from utils.trade_executor_router import route_signal
-from utils.trade_executor_margin import get_margin_position_state
+from utils.trade_executor_margin import get_margin_operational_state
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 
@@ -164,42 +164,53 @@ def enviar_alerta_critica_trade(
 
 def evaluar_reconciliacion_pre_trade(signal: str, symbol: str) -> dict:
     """
-    Revisa la posición REAL en Binance antes de ejecutar.
+    Revisa:
+      - posición REAL en Binance
+      - estado OPEN en Sheets
+      - consistencia entre ambos
 
     Reglas:
-      - BUY + ya hay posición real  -> BLOCK
-      - SELL + no hay posición real -> BLOCK
-      - si no se puede leer Binance -> BLOCK por seguridad
+      1) si no se puede leer Binance/Sheets -> BLOCK
+      2) si Binance y Sheets no cuadran       -> BLOCK
+      3) BUY  + ya hay posición real         -> BLOCK
+      4) SELL + no hay posición real         -> BLOCK
     """
-    recon = get_margin_position_state(symbol)
+    oper = get_margin_operational_state(symbol)
 
-    if not recon.get("ok", False):
+    if not oper.get("ok", False):
         return {
             "allow_trade": False,
-            "reason": "RECON_FAILED",
-            "recon": recon,
+            "reason": oper.get("status", "OPER_STATE_FAILED"),
+            "oper": oper,
         }
 
-    has_position = bool(recon.get("has_position", False))
+    if not oper.get("consistent", False):
+        return {
+            "allow_trade": False,
+            "reason": oper.get("mismatch_reason") or "OPER_STATE_MISMATCH",
+            "oper": oper,
+        }
+
+    has_position = bool(oper.get("has_position", False))
 
     if signal == "BUY" and has_position:
         return {
             "allow_trade": False,
             "reason": "BLOCK_BUY_ALREADY_OPEN",
-            "recon": recon,
+            "oper": oper,
         }
 
     if signal == "SELL" and not has_position:
         return {
             "allow_trade": False,
             "reason": "BLOCK_SELL_NO_POSITION",
-            "recon": recon,
+            "oper": oper,
         }
 
     return {
         "allow_trade": True,
         "reason": "OK",
-        "recon": recon,
+        "oper": oper,
     }
 
 def enviar_alerta_reconciliacion(
@@ -209,7 +220,11 @@ def enviar_alerta_reconciliacion(
     ts: pd.Timestamp,
     recon_eval: dict,
 ):
-    recon = recon_eval.get("recon", {}) or {}
+    oper = recon_eval.get("oper", {}) or {}
+    recon = oper.get("recon", {}) or {}
+    sheet = oper.get("sheet", {}) or {}
+    last_open = sheet.get("last_open_trade") or {}
+
     ts_cr = ts.tz_convert(CR) if getattr(ts, "tzinfo", None) is not None else pd.Timestamp(ts).tz_localize("UTC").tz_convert(CR)
 
     mensaje = (
@@ -219,13 +234,18 @@ def enviar_alerta_reconciliacion(
         f"Trade: {trade_symbol}\n"
         f"Reason: {recon_eval.get('reason')}\n"
         f"Time: {ts_cr.isoformat()}\n"
-        f"Recon status: {recon.get('status')}\n"
-        f"Has position: {recon.get('has_position')}\n"
+        f"Oper status: {oper.get('status')}\n"
+        f"Consistent: {oper.get('consistent')}\n"
+        f"Has position: {oper.get('has_position')}\n"
+        f"Has OPEN in Sheets: {oper.get('has_open_trade')}\n"
+        f"OPEN count: {oper.get('open_count')}\n"
         f"Free qty: {recon.get('free_qty')}\n"
         f"Net qty: {recon.get('net_asset_qty')}\n"
         f"Borrowed USDT: {recon.get('borrowed_usdt')}\n"
         f"Margin level: {recon.get('margin_level')}\n"
-        f"Error: {recon.get('error')}"
+        f"Last OPEN trade_id: {last_open.get('trade_id')}\n"
+        f"Last OPEN row: {last_open.get('row_number')}\n"
+        f"Error: {oper.get('error')}"
     )
     enviar_mensaje_telegram(mensaje)
 
@@ -653,14 +673,15 @@ def main():
                     "reason": "SPOT_MODE_SKIP_RECON",
                     "recon": {},
                 }
-
+            #
             print(
                 f"📡 [RECON_EVAL] allow_trade={recon_eval.get('allow_trade')} "
                 f"reason={recon_eval.get('reason')} "
-                f"recon_status={recon_eval.get('recon', {}).get('status')}",
+                f"oper_status={recon_eval.get('oper', {}).get('status')} "
+                f"consistent={recon_eval.get('oper', {}).get('consistent')}",
                 flush=True
             )
-
+            #    
             if not recon_eval.get("allow_trade", False):
                 estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
 
