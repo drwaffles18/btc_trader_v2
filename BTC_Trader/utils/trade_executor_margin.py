@@ -167,6 +167,177 @@ def _find_last_open_trade_row(symbol: str, trade_mode: str = "MARGIN") -> Option
 
     return None
 
+def get_sheet_open_trade_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[str, Any]:
+    """
+    Lee el estado del log en Sheets para un símbolo/modo.
+
+    Retorna:
+      - has_open_trade: bool
+      - open_count: cuántas filas OPEN existen
+      - last_open_trade: última fila OPEN encontrada
+      - ok / status / error
+    """
+    ws = _get_ws_trades()
+    if ws is None:
+        return {
+            "ok": False,
+            "status": "NO_WS_TRADES",
+            "symbol": symbol,
+            "trade_mode": trade_mode,
+            "has_open_trade": False,
+            "open_count": 0,
+            "last_open_trade": None,
+            "error": "Worksheet Trades no disponible",
+        }
+
+    try:
+        records = ws.get_all_records()
+    except Exception as e:
+        print(f"⚠️ [MARGIN] get_all_records falló leyendo estado OPEN: {e}", flush=True)
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "symbol": symbol,
+            "trade_mode": trade_mode,
+            "has_open_trade": False,
+            "open_count": 0,
+            "last_open_trade": None,
+            "error": str(e),
+        }
+
+    open_rows = []
+    symbol_u = symbol.strip().upper()
+    mode_u = trade_mode.strip().upper()
+
+    for idx, r in enumerate(records, start=2):  # +2 por header + 1-index
+        if (
+            str(r.get("symbol", "")).strip().upper() == symbol_u
+            and str(r.get("trade_mode", "")).strip().upper() == mode_u
+            and str(r.get("status", "")).strip().upper() == "OPEN"
+        ):
+            try:
+                qty = float(r.get("qty", 0) or 0)
+            except Exception:
+                qty = 0.0
+
+            try:
+                entry_price = float(r.get("entry_price", 0) or 0)
+            except Exception:
+                entry_price = 0.0
+
+            open_rows.append({
+                "row_number": idx,
+                "trade_id": r.get("trade_id", ""),
+                "qty": qty,
+                "entry_price": entry_price,
+                "entry_time": r.get("entry_time", ""),
+                "raw": r,
+            })
+
+    last_open_trade = open_rows[-1] if open_rows else None
+
+    out = {
+        "ok": True,
+        "status": "OK",
+        "symbol": symbol,
+        "trade_mode": trade_mode,
+        "has_open_trade": bool(open_rows),
+        "open_count": len(open_rows),
+        "last_open_trade": last_open_trade,
+        "error": None,
+    }
+
+    print(
+        f"🧾 [SHEETS_STATE] {symbol} | has_open_trade={out['has_open_trade']} | "
+        f"open_count={out['open_count']} | "
+        f"last_trade_id={(last_open_trade or {}).get('trade_id')}",
+        flush=True
+    )
+
+    return out
+
+def get_margin_operational_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[str, Any]:
+    """
+    Combina:
+      - estado REAL en Binance (posición margin)
+      - estado LOG en Sheets (filas OPEN)
+
+    y devuelve una evaluación de consistencia operativa.
+    """
+    recon = get_margin_position_state(symbol)
+    sheet = get_sheet_open_trade_state(symbol, trade_mode=trade_mode)
+
+    if not recon.get("ok", False):
+        return {
+            "ok": False,
+            "status": "RECON_FAILED",
+            "symbol": symbol,
+            "has_position": False,
+            "has_open_trade": False,
+            "consistent": False,
+            "mismatch_reason": "RECON_FAILED",
+            "recon": recon,
+            "sheet": sheet,
+            "error": recon.get("error"),
+        }
+
+    if not sheet.get("ok", False):
+        return {
+            "ok": False,
+            "status": "SHEET_STATE_FAILED",
+            "symbol": symbol,
+            "has_position": bool(recon.get("has_position", False)),
+            "has_open_trade": False,
+            "consistent": False,
+            "mismatch_reason": "SHEET_STATE_FAILED",
+            "recon": recon,
+            "sheet": sheet,
+            "error": sheet.get("error"),
+        }
+
+    has_position = bool(recon.get("has_position", False))
+    has_open_trade = bool(sheet.get("has_open_trade", False))
+    open_count = int(sheet.get("open_count", 0) or 0)
+
+    consistent = True
+    mismatch_reason = None
+
+    if open_count > 1:
+        consistent = False
+        mismatch_reason = "MULTIPLE_OPEN_TRADES"
+
+    elif has_position and not has_open_trade:
+        consistent = False
+        mismatch_reason = "POSITION_WITHOUT_SHEET_OPEN"
+
+    elif (not has_position) and has_open_trade:
+        consistent = False
+        mismatch_reason = "SHEET_OPEN_WITHOUT_POSITION"
+
+    out = {
+        "ok": True,
+        "status": "OK",
+        "symbol": symbol,
+        "has_position": has_position,
+        "has_open_trade": has_open_trade,
+        "open_count": open_count,
+        "consistent": consistent,
+        "mismatch_reason": mismatch_reason,
+        "recon": recon,
+        "sheet": sheet,
+        "error": None,
+    }
+
+    print(
+        f"🧠 [OPER_STATE] {symbol} | has_position={has_position} | "
+        f"has_open_trade={has_open_trade} | open_count={open_count} | "
+        f"consistent={consistent} | mismatch_reason={mismatch_reason}",
+        flush=True
+    )
+
+    return out
+
+
 def _update_trade_close(
     row_number: int,
     exit_price: Optional[float],
