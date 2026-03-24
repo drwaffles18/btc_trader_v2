@@ -423,6 +423,138 @@ def _margin_sell_qty(client, symbol: str, qty: float) -> Dict[str, Any]:
         quantity=str(qty),
         isIsolated="FALSE",
     )
+# =============================================================
+# RECONCILIATION / POSITION STATE
+# =============================================================
+
+def get_margin_position_state(symbol: str) -> dict:
+    """
+    Lee el estado REAL de la cuenta cross margin para el símbolo dado.
+
+    Retorna un dict canónico con:
+      - has_position: si hay posición real abierta del asset base
+      - free_qty: cantidad libre del asset base (ej. BNB)
+      - net_asset_qty: netAsset del asset base
+      - borrowed_base: deuda del asset base
+      - free_usdt: USDT libre
+      - borrowed_usdt: deuda USDT
+      - margin_level: margin level reportado por Binance
+      - error / ok
+    """
+    try:
+        client = get_client()
+        if client is None:
+            init_err = get_last_init_error()
+            print(f"❌ [RECON] get_client() returned None | init_err={init_err}", flush=True)
+            return {
+                "ok": False,
+                "status": "NO_CLIENT",
+                "symbol": symbol,
+                "asset": _asset_from_symbol(symbol),
+                "has_position": False,
+                "free_qty": 0.0,
+                "net_asset_qty": 0.0,
+                "borrowed_base": 0.0,
+                "free_usdt": 0.0,
+                "borrowed_usdt": 0.0,
+                "margin_level": None,
+                "error": f"get_client() returned None | init_err={init_err}",
+            }
+
+        acct = client.get_margin_account()
+        assets = acct.get("userAssets", []) or []
+
+        base_asset = _asset_from_symbol(symbol)
+
+        base_row = None
+        usdt_row = None
+
+        for row in assets:
+            asset = (row.get("asset") or "").upper()
+            if asset == base_asset:
+                base_row = row
+            elif asset == "USDT":
+                usdt_row = row
+
+        def _f(row, key):
+            if not row:
+                return 0.0
+            try:
+                return float(row.get(key, 0) or 0)
+            except Exception:
+                return 0.0
+
+        free_qty       = _f(base_row, "free")
+        locked_qty     = _f(base_row, "locked")
+        borrowed_base  = _f(base_row, "borrowed")
+        interest_base  = _f(base_row, "interest")
+        net_asset_qty  = _f(base_row, "netAsset")
+
+        free_usdt      = _f(usdt_row, "free")
+        borrowed_usdt  = _f(usdt_row, "borrowed")
+        interest_usdt  = _f(usdt_row, "interest")
+        net_asset_usdt = _f(usdt_row, "netAsset")
+
+        margin_level = None
+        try:
+            ml = acct.get("marginLevel")
+            margin_level = float(ml) if ml is not None else None
+        except Exception:
+            margin_level = None
+
+        # Regla conservadora de "posición abierta"
+        # Basta con tener asset base libre / neto positivo relevante.
+        has_position = (
+            abs(free_qty) > 1e-8 or
+            abs(net_asset_qty) > 1e-8
+        )
+
+        out = {
+            "ok": True,
+            "status": "OK",
+            "symbol": symbol,
+            "asset": base_asset,
+            "has_position": has_position,
+            "free_qty": free_qty,
+            "locked_qty": locked_qty,
+            "net_asset_qty": net_asset_qty,
+            "borrowed_base": borrowed_base,
+            "interest_base": interest_base,
+            "free_usdt": free_usdt,
+            "borrowed_usdt": borrowed_usdt,
+            "interest_usdt": interest_usdt,
+            "net_asset_usdt": net_asset_usdt,
+            "margin_level": margin_level,
+            "raw": acct,
+            "error": None,
+        }
+
+        print(
+            f"📡 [RECON] {symbol} | has_position={out['has_position']} | "
+            f"free_qty={free_qty:.8f} | net_asset_qty={net_asset_qty:.8f} | "
+            f"borrowed_usdt={borrowed_usdt:.8f} | margin_level={margin_level}",
+            flush=True
+        )
+
+        return out
+
+    except Exception as e:
+        print(f"❌ [RECON] Error leyendo estado margin para {symbol}: {e}", flush=True)
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "symbol": symbol,
+            "asset": _asset_from_symbol(symbol),
+            "has_position": False,
+            "free_qty": 0.0,
+            "net_asset_qty": 0.0,
+            "borrowed_base": 0.0,
+            "free_usdt": 0.0,
+            "borrowed_usdt": 0.0,
+            "margin_level": None,
+            "error": str(e),
+        }
+
 
 # =============================================================
 # 5) ENTRYPOINT MARGIN
