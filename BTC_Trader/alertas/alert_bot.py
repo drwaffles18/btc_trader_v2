@@ -25,6 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.load_from_sheets import load_symbol_df
 from utils.trade_executor_router import route_signal
+from utils.trade_executor_margin import get_margin_position_state
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 
@@ -160,6 +161,73 @@ def enviar_alerta_critica_trade(
         lines.append(f"Trade price: {trade_price:,.4f}")
 
     enviar_mensaje_telegram("\n".join(lines))
+
+def evaluar_reconciliacion_pre_trade(signal: str, symbol: str) -> dict:
+    """
+    Revisa la posición REAL en Binance antes de ejecutar.
+
+    Reglas:
+      - BUY + ya hay posición real  -> BLOCK
+      - SELL + no hay posición real -> BLOCK
+      - si no se puede leer Binance -> BLOCK por seguridad
+    """
+    recon = get_margin_position_state(symbol)
+
+    if not recon.get("ok", False):
+        return {
+            "allow_trade": False,
+            "reason": "RECON_FAILED",
+            "recon": recon,
+        }
+
+    has_position = bool(recon.get("has_position", False))
+
+    if signal == "BUY" and has_position:
+        return {
+            "allow_trade": False,
+            "reason": "BLOCK_BUY_ALREADY_OPEN",
+            "recon": recon,
+        }
+
+    if signal == "SELL" and not has_position:
+        return {
+            "allow_trade": False,
+            "reason": "BLOCK_SELL_NO_POSITION",
+            "recon": recon,
+        }
+
+    return {
+        "allow_trade": True,
+        "reason": "OK",
+        "recon": recon,
+    }
+
+def enviar_alerta_reconciliacion(
+    signal: str,
+    trigger_symbol: str,
+    trade_symbol: str,
+    ts: pd.Timestamp,
+    recon_eval: dict,
+):
+    recon = recon_eval.get("recon", {}) or {}
+    ts_cr = ts.tz_convert(CR) if getattr(ts, "tzinfo", None) is not None else pd.Timestamp(ts).tz_localize("UTC").tz_convert(CR)
+
+    mensaje = (
+        "🚨 RECONCILIATION BLOCK\n"
+        f"Signal: {signal}\n"
+        f"Trigger: {trigger_symbol}\n"
+        f"Trade: {trade_symbol}\n"
+        f"Reason: {recon_eval.get('reason')}\n"
+        f"Time: {ts_cr.isoformat()}\n"
+        f"Recon status: {recon.get('status')}\n"
+        f"Has position: {recon.get('has_position')}\n"
+        f"Free qty: {recon.get('free_qty')}\n"
+        f"Net qty: {recon.get('net_asset_qty')}\n"
+        f"Borrowed USDT: {recon.get('borrowed_usdt')}\n"
+        f"Margin level: {recon.get('margin_level')}\n"
+        f"Error: {recon.get('error')}"
+    )
+    enviar_mensaje_telegram(mensaje)
 
 
 # ==========================================================
@@ -548,8 +616,9 @@ def main():
             f"signal={signal} | EXEC? {debe_enviar}",
             flush=True
         )
-
+        ##
         # 6) Ejecutar/enviar
+
         if debe_enviar:
             emoji = "🟢" if signal == "BUY" else "🔴"
 
@@ -570,42 +639,84 @@ def main():
 
             enviar_mensaje_telegram(mensaje)
 
-            trade_result = ejecutar_trade_con_retry(
-                signal=signal,
-                ts=ts,
-                btc_price=btc_price,
-                bnb_price=bnb_price,
+            # =====================================================
+            # PRIORIDAD 2 — RECONCILIACIÓN PRE-TRADE
+            # =====================================================
+            if USE_MARGIN:
+                recon_eval = evaluar_reconciliacion_pre_trade(
+                    signal=signal,
+                    symbol=TRADE_SYMBOL,
+                )
+            else:
+                recon_eval = {
+                    "allow_trade": True,
+                    "reason": "SPOT_MODE_SKIP_RECON",
+                    "recon": {},
+                }
+
+            print(
+                f"📡 [RECON_EVAL] allow_trade={recon_eval.get('allow_trade')} "
+                f"reason={recon_eval.get('reason')} "
+                f"recon_status={recon_eval.get('recon', {}).get('status')}",
+                flush=True
             )
 
-            print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado final {signal}: {trade_result}", flush=True)
-
-            # Commit SOLO si el trade realmente se ejecutó
-            if bool(trade_result.get("executed", False)) and trade_result.get("status") == "OK":
-                estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
-                print(f"✅ [STATE] Commit de estado por ejecución real: {signal}", flush=True)
-            else:
+            if not recon_eval.get("allow_trade", False):
                 estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
+
                 print(
-                    f"⚠️ [STATE] Sin commit de señal. "
-                    f"trade_result.status={trade_result.get('status')} "
-                    f"executed={trade_result.get('executed')}",
+                    f"⛔ [TRADE BLOCKED] signal={signal} "
+                    f"reason={recon_eval.get('reason')}",
                     flush=True
                 )
 
-                enviar_alerta_critica_trade(
+                enviar_alerta_reconciliacion(
                     signal=signal,
                     trigger_symbol=symbol,
                     trade_symbol=TRADE_SYMBOL,
-                    trigger_price=btc_price,
-                    trade_price=bnb_price,
                     ts=ts,
-                    trade_result=trade_result,
+                    recon_eval=recon_eval,
                 )
+
+            else:
+                trade_result = ejecutar_trade_con_retry(
+                    signal=signal,
+                    ts=ts,
+                    btc_price=btc_price,
+                    bnb_price=bnb_price,
+                )
+
+                print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado final {signal}: {trade_result}", flush=True)
+
+                # Commit SOLO si el trade realmente se ejecutó
+                if bool(trade_result.get("executed", False)) and trade_result.get("status") == "OK":
+                    estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
+                    print(f"✅ [STATE] Commit de estado por ejecución real: {signal}", flush=True)
+                else:
+                    estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
+                    print(
+                        f"⚠️ [STATE] Sin commit de señal. "
+                        f"trade_result.status={trade_result.get('status')} "
+                        f"executed={trade_result.get('executed')}",
+                        flush=True
+                    )
+
+                    enviar_alerta_critica_trade(
+                        signal=signal,
+                        trigger_symbol=symbol,
+                        trade_symbol=TRADE_SYMBOL,
+                        trigger_price=btc_price,
+                        trade_price=bnb_price,
+                        ts=ts,
+                        trade_result=trade_result,
+                    )
+            ##
         else:
             estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
 
     except Exception as e:
         print(f"❌ Error procesando trigger {TRIGGER_SYMBOL}: {e}", flush=True)
+        estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": prev_close}
 
     print(f"💾 Guardando estado actual: {estado_actual}", flush=True)
     guardar_estado_actual(estado_actual)
