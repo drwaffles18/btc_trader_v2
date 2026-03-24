@@ -209,7 +209,7 @@ def get_sheet_open_trade_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[
     symbol_u = symbol.strip().upper()
     mode_u = trade_mode.strip().upper()
 
-    for idx, r in enumerate(records, start=2):  # +2 por header + 1-index
+    for idx, r in enumerate(records, start=2):
         if (
             str(r.get("symbol", "")).strip().upper() == symbol_u
             and str(r.get("trade_mode", "")).strip().upper() == mode_u
@@ -255,88 +255,6 @@ def get_sheet_open_trade_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[
     )
 
     return out
-
-def get_margin_operational_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[str, Any]:
-    """
-    Combina:
-      - estado REAL en Binance (posición margin)
-      - estado LOG en Sheets (filas OPEN)
-
-    y devuelve una evaluación de consistencia operativa.
-    """
-    recon = get_margin_position_state(symbol)
-    sheet = get_sheet_open_trade_state(symbol, trade_mode=trade_mode)
-
-    if not recon.get("ok", False):
-        return {
-            "ok": False,
-            "status": "RECON_FAILED",
-            "symbol": symbol,
-            "has_position": False,
-            "has_open_trade": False,
-            "consistent": False,
-            "mismatch_reason": "RECON_FAILED",
-            "recon": recon,
-            "sheet": sheet,
-            "error": recon.get("error"),
-        }
-
-    if not sheet.get("ok", False):
-        return {
-            "ok": False,
-            "status": "SHEET_STATE_FAILED",
-            "symbol": symbol,
-            "has_position": bool(recon.get("has_position", False)),
-            "has_open_trade": False,
-            "consistent": False,
-            "mismatch_reason": "SHEET_STATE_FAILED",
-            "recon": recon,
-            "sheet": sheet,
-            "error": sheet.get("error"),
-        }
-
-    has_position = bool(recon.get("has_position", False))
-    has_open_trade = bool(sheet.get("has_open_trade", False))
-    open_count = int(sheet.get("open_count", 0) or 0)
-
-    consistent = True
-    mismatch_reason = None
-
-    if open_count > 1:
-        consistent = False
-        mismatch_reason = "MULTIPLE_OPEN_TRADES"
-
-    elif has_position and not has_open_trade:
-        consistent = False
-        mismatch_reason = "POSITION_WITHOUT_SHEET_OPEN"
-
-    elif (not has_position) and has_open_trade:
-        consistent = False
-        mismatch_reason = "SHEET_OPEN_WITHOUT_POSITION"
-
-    out = {
-        "ok": True,
-        "status": "OK",
-        "symbol": symbol,
-        "has_position": has_position,
-        "has_open_trade": has_open_trade,
-        "open_count": open_count,
-        "consistent": consistent,
-        "mismatch_reason": mismatch_reason,
-        "recon": recon,
-        "sheet": sheet,
-        "error": None,
-    }
-
-    print(
-        f"🧠 [OPER_STATE] {symbol} | has_position={has_position} | "
-        f"has_open_trade={has_open_trade} | open_count={open_count} | "
-        f"consistent={consistent} | mismatch_reason={mismatch_reason}",
-        flush=True
-    )
-
-    return out
-
 
 def _update_trade_close(
     row_number: int,
@@ -594,9 +512,13 @@ def _margin_sell_qty(client, symbol: str, qty: float) -> Dict[str, Any]:
         quantity=str(qty),
         isIsolated="FALSE",
     )
+
 # =============================================================
-# RECONCILIATION / POSITION STATE
+# 5) RECONCILIATION / POSITION STATE
 # =============================================================
+
+def _asset_from_symbol(symbol: str) -> str:
+    return symbol.replace("USDT", "").strip().upper()
 
 def get_margin_position_state(symbol: str) -> dict:
     """
@@ -673,8 +595,6 @@ def get_margin_position_state(symbol: str) -> dict:
         except Exception:
             margin_level = None
 
-        # Regla conservadora de "posición abierta"
-        # Basta con tener asset base libre / neto positivo relevante.
         has_position = (
             abs(free_qty) > 1e-8 or
             abs(net_asset_qty) > 1e-8
@@ -726,9 +646,87 @@ def get_margin_position_state(symbol: str) -> dict:
             "error": str(e),
         }
 
+def get_margin_operational_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[str, Any]:
+    """
+    Combina:
+      - estado REAL en Binance (posición margin)
+      - estado LOG en Sheets (filas OPEN)
+
+    y devuelve una evaluación de consistencia operativa.
+    """
+    recon = get_margin_position_state(symbol)
+    sheet = get_sheet_open_trade_state(symbol, trade_mode=trade_mode)
+
+    if not recon.get("ok", False):
+        return {
+            "ok": False,
+            "status": "RECON_FAILED",
+            "symbol": symbol,
+            "has_position": False,
+            "has_open_trade": False,
+            "consistent": False,
+            "mismatch_reason": "RECON_FAILED",
+            "recon": recon,
+            "sheet": sheet,
+            "error": recon.get("error"),
+        }
+
+    if not sheet.get("ok", False):
+        return {
+            "ok": False,
+            "status": "SHEET_STATE_FAILED",
+            "symbol": symbol,
+            "has_position": bool(recon.get("has_position", False)),
+            "has_open_trade": False,
+            "consistent": False,
+            "mismatch_reason": "SHEET_STATE_FAILED",
+            "recon": recon,
+            "sheet": sheet,
+            "error": sheet.get("error"),
+        }
+
+    has_position = bool(recon.get("has_position", False))
+    has_open_trade = bool(sheet.get("has_open_trade", False))
+    open_count = int(sheet.get("open_count", 0) or 0)
+
+    consistent = True
+    mismatch_reason = None
+
+    if open_count > 1:
+        consistent = False
+        mismatch_reason = "MULTIPLE_OPEN_TRADES"
+    elif has_position and not has_open_trade:
+        consistent = False
+        mismatch_reason = "POSITION_WITHOUT_SHEET_OPEN"
+    elif (not has_position) and has_open_trade:
+        consistent = False
+        mismatch_reason = "SHEET_OPEN_WITHOUT_POSITION"
+
+    out = {
+        "ok": True,
+        "status": "OK",
+        "symbol": symbol,
+        "has_position": has_position,
+        "has_open_trade": has_open_trade,
+        "open_count": open_count,
+        "consistent": consistent,
+        "mismatch_reason": mismatch_reason,
+        "recon": recon,
+        "sheet": sheet,
+        "error": None,
+    }
+
+    print(
+        f"🧠 [OPER_STATE] {symbol} | has_position={has_position} | "
+        f"has_open_trade={has_open_trade} | open_count={open_count} | "
+        f"consistent={consistent} | mismatch_reason={mismatch_reason}",
+        flush=True
+    )
+
+    return out
 
 # =============================================================
-# 5) ENTRYPOINT MARGIN
+# 6) ENTRYPOINT MARGIN
 # =============================================================
 
 def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -852,7 +850,7 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
             )
 
         elif side == "SELL":
-            asset = symbol.replace("USDT", "").strip()
+            asset = _asset_from_symbol(symbol)
             qty_avail = _get_margin_free_asset(client, asset)
             print(f"ℹ️ [MARGIN] {asset} free≈{qty_avail:.8f}", flush=True)
 
