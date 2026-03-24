@@ -5,6 +5,10 @@
 # - Datos: Google Sheets (1200 velas) + wait/poll para esperar incremental job
 # - Anti-caídas: estado.json (transición real + last_close_ms)
 # - Telegram: incluye precio BTC (trigger) + precio BNB (trade)
+# - PRIORIDAD 1:
+#     * retry real de ejecución
+#     * alerta crítica real cuando falle
+#     * commit de estado SOLO si el trade se ejecutó
 # ==========================================================
 
 import os
@@ -40,9 +44,12 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 USE_MARGIN = os.getenv("USE_MARGIN", "false").lower() == "true"
 
 # Espera para que el incremental job termine de escribir en Sheets
-# (tu log: ~37s a ~60s total)
 MAX_WAIT_SECONDS = int(os.getenv("MAX_WAIT_SECONDS", "90"))
 POLL_EVERY_SEC   = int(os.getenv("POLL_EVERY_SEC", "6"))
+
+# Retry de ejecución (PRIORIDAD 1)
+MAX_ROUTE_RETRIES      = int(os.getenv("MAX_ROUTE_RETRIES", "3"))
+ROUTE_RETRY_SLEEP_SEC  = int(os.getenv("ROUTE_RETRY_SLEEP_SEC", "3"))
 
 # Para logs claros (Railway)
 ALLOWED_SYMBOLS_ENV = (os.getenv("ALLOWED_SYMBOLS") or "").strip().upper()
@@ -55,12 +62,12 @@ print(f"🎯 TRIGGER_SYMBOL={TRIGGER_SYMBOL}", flush=True)
 print(f"💱 TRADE_SYMBOL={TRADE_SYMBOL}", flush=True)
 print(f"🔒 STRICT_TRADE_SYMBOL={STRICT_TRADE_SYMBOL} | ALLOWED_SYMBOLS={ALLOWED_SYMBOLS_ENV or '(not set)'}", flush=True)
 print(f"⏳ WAIT: MAX_WAIT_SECONDS={MAX_WAIT_SECONDS} | POLL_EVERY_SEC={POLL_EVERY_SEC}", flush=True)
+print(f"🔁 EXEC RETRY: MAX_ROUTE_RETRIES={MAX_ROUTE_RETRIES} | ROUTE_RETRY_SLEEP_SEC={ROUTE_RETRY_SLEEP_SEC}", flush=True)
 print("==================================================", flush=True)
 
 
 # ==========================================================
 # LEGACY PARAMS (NO se usan en la estrategia activa)
-# Mantener por si quieres volver al momentum viejo.
 # ==========================================================
 
 SYMBOL_PARAMS = {
@@ -80,10 +87,10 @@ P = dict(
     mom_win=4,
     speed_win=9,
     accel_win=7,
-    z_win=20,          # ✅ clave
+    z_win=20,
     zspeed_min=0.30,
     zaccel_min=0.10,
-    zaccel_gate=4.0    # ✅ champion
+    zaccel_gate=4.0
 )
 
 ENERGY_ZWIN = 120
@@ -91,8 +98,8 @@ STRUCT_ZWIN = 120
 STRUCT_WIN  = 48
 DON_WIN     = 48
 
-ENTRY_ZENERGY_MIN = 1.8      # ✅ champion
-ENTRY_K_STRUCT    = 0.4      # ✅ champion
+ENTRY_ZENERGY_MIN = 1.8
+ENTRY_K_STRUCT    = 0.4
 ENTRY_USE_ASYM    = False
 ENTRY_N_DOWN      = 1
 
@@ -121,6 +128,40 @@ def enviar_mensaje_telegram(mensaje: str):
         print(f"⚠️ Telegram excepción: {e}", flush=True)
 
 
+def enviar_alerta_critica_trade(
+    signal: str,
+    trigger_symbol: str,
+    trade_symbol: str,
+    trigger_price: float | None,
+    trade_price: float | None,
+    ts: pd.Timestamp,
+    trade_result: dict,
+):
+    """
+    Alerta CRÍTICA cuando una ejecución falla después de existir una señal válida.
+    """
+    ts_cr = ts.tz_convert(CR) if getattr(ts, "tzinfo", None) is not None else pd.Timestamp(ts).tz_localize("UTC").tz_convert(CR)
+
+    lines = [
+        "🚨 CRITICAL TRADE FAILURE",
+        f"Signal: {signal}",
+        f"Trigger: {trigger_symbol}",
+        f"Trade: {trade_symbol}",
+        f"Status: {trade_result.get('status')}",
+        f"Executed: {trade_result.get('executed')}",
+        f"Error: {trade_result.get('error')}",
+        f"Trade ID: {trade_result.get('trade_id')}",
+        f"Time: {ts_cr.isoformat()}",
+    ]
+
+    if trigger_price is not None:
+        lines.append(f"Trigger price: {trigger_price:,.4f}")
+    if trade_price is not None:
+        lines.append(f"Trade price: {trade_price:,.4f}")
+
+    enviar_mensaje_telegram("\n".join(lines))
+
+
 # ==========================================================
 # Sheets helpers
 # ==========================================================
@@ -128,63 +169,38 @@ def enviar_mensaje_telegram(mensaje: str):
 CR = pytz.timezone("America/Costa_Rica")
 
 def to_utc(ts) -> pd.Timestamp:
-    """
-    Acepta string/datetime/timestamp.
-    Devuelve Timestamp tz-aware en UTC.
-    """
     t = pd.to_datetime(ts)
     if getattr(t, "tzinfo", None) is None:
-        # naive -> asumir CR (o la tz que uses en sheets)
         t = t.tz_localize(CR)
-    # aware -> convertir
     return t.tz_convert("UTC")
 
 
 def _parse_close_time_series(s: pd.Series) -> pd.DatetimeIndex:
-    """
-    Convierte 'Close time' a DatetimeIndex tz-aware en UTC, robusto a:
-    - strings con offset (-06:00)
-    - datetime tz-aware
-    - mezcla rara (object) por lecturas durante escritura
-    """
     if s is None or len(s) == 0:
         return pd.DatetimeIndex([], tz="UTC", name="ts")
 
-    # 1) Si ya es datetime tz-aware -> tz_convert directo
     if is_datetime64tz_dtype(s):
         return pd.DatetimeIndex(s.dt.tz_convert("UTC"), name="ts")
 
-    # 2) Forzar a string para evitar mezcla Timestamp/string/NaT en object
-    #    (Google Sheets a veces devuelve cosas raras si se lee mientras escriben)
     s_str = s.astype(str).replace({"": np.nan, "None": np.nan, "nan": np.nan})
-
-    # 3) Parsear. Si viene con offset (-06:00), pandas lo entiende.
     dt = pd.to_datetime(s_str, errors="coerce")
 
-    # 4) Si quedó tz-aware (porque el string tenía -06:00) -> tz_convert
     try:
         if dt.dt.tz is not None:
             return pd.DatetimeIndex(dt.dt.tz_convert("UTC"), name="ts")
     except Exception:
         pass
 
-    # 5) Si quedó naive -> asumir CR y localize, luego a UTC
     dt = dt.dt.tz_localize(CR, ambiguous="infer", nonexistent="shift_forward").dt.tz_convert("UTC")
     return pd.DatetimeIndex(dt, name="ts")
 
+
 def _expected_last_close_utc(now_utc: pd.Timestamp) -> pd.Timestamp:
-    """
-    La vela "cerrada" más reciente tiene close_time = (floor_5m(now) - 1ms).
-    Ej: 11:04:59.999...
-    """
     floor_5m = now_utc.floor("5min")
     return floor_5m - pd.Timedelta(milliseconds=1)
 
+
 def _load_ohlcv_from_sheet(symbol: str) -> pd.DataFrame:
-    """
-    Carga df desde Sheets y devuelve OHLCV con index = Close time UTC.
-    Requiere columnas: Open, High, Low, Close, Volume, Close time
-    """
     df = load_symbol_df(symbol)
     if df is None or df.empty:
         raise RuntimeError(f"[SHEETS] {symbol}: DF vacío")
@@ -199,22 +215,15 @@ def _load_ohlcv_from_sheet(symbol: str) -> pd.DataFrame:
     out.index = pd.DatetimeIndex(close_utc, name="ts")
     out = out.sort_index()
 
-    # numeric
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
+
     out = out.dropna(subset=["Open", "High", "Low", "Close"]).copy()
     out["Volume"] = out["Volume"].fillna(0.0)
-
     return out
 
-def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame, pd.Timestamp, int]:
-    """
-    Espera hasta que Sheets tenga la última vela cerrada (o al menos una vela NUEVA vs prev_close_ms),
-    para evitar leer antes de que termine el incremental job.
 
-    Return:
-      ohlcv (index=close_time_utc), ts_last (close_time_utc), last_close_ms (epoch ms aproximado)
-    """
+def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame, pd.Timestamp, int]:
     t0 = time.time()
     last_err = None
 
@@ -225,8 +234,6 @@ def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame
             if pd.isna(ts_last):
                 raise RuntimeError("ts_last es NaT")
 
-            # Aproximación last_close_ms: (ts_last + 1ms) en epoch ms
-            # porque tu 'Close time' es ...:59.999 local, equivalente a close_ms-1 en el enfoque anterior
             last_close_ms = int((ts_last + pd.Timedelta(milliseconds=1)).value // 1_000_000)
 
             now_utc = pd.Timestamp.now(tz="UTC")
@@ -236,10 +243,8 @@ def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame
             ok_new = last_close_ms != int(prev_close_ms or 0)
 
             if ok_expected or ok_new:
-                # si está al día o al menos avanzó vs estado anterior, seguimos
                 return ohlcv, ts_last, last_close_ms
 
-            # Si no está fresco, esperamos
             waited = int(time.time() - t0)
             if waited >= MAX_WAIT_SECONDS:
                 print(
@@ -260,11 +265,9 @@ def _wait_for_fresh_sheet(symbol: str, prev_close_ms: int) -> tuple[pd.DataFrame
             if waited >= MAX_WAIT_SECONDS:
                 raise RuntimeError(f"[SHEETS] No pude obtener data fresca para {symbol}. Último error: {last_err}")
             time.sleep(POLL_EVERY_SEC)
-            
+
+
 def _wait_trade_sheet_at_least(symbol: str, target_ts: pd.Timestamp) -> pd.DataFrame:
-    """
-    Espera hasta que el sheet de TRADE_SYMBOL tenga ts_last >= target_ts.
-    """
     t0 = time.time()
     last_err = None
 
@@ -292,6 +295,7 @@ def _wait_trade_sheet_at_least(symbol: str, target_ts: pd.Timestamp) -> pd.DataF
                 return _load_ohlcv_from_sheet(symbol)
             time.sleep(POLL_EVERY_SEC)
 
+
 # ==========================================================
 # WINNER/CHAMPION functions (Energy + Structure)
 # ==========================================================
@@ -300,6 +304,7 @@ def rolling_z(x: pd.Series, win: int) -> pd.Series:
     mu = x.rolling(win, min_periods=win).mean()
     sd = x.rolling(win, min_periods=win).std().replace(0, np.nan)
     return ((x - mu) / sd).fillna(0.0)
+
 
 def build_features_winner(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
@@ -363,8 +368,10 @@ def build_features_winner(df: pd.DataFrame) -> pd.DataFrame:
     d["atr_pct"] = d["range_pct"].rolling(int(STRUCT_WIN), min_periods=1).mean().fillna(0.0)
     return d
 
+
 def struct_modulated_threshold(d: pd.DataFrame, base_thr: float, k: float) -> pd.Series:
     return float(base_thr) - float(k) * (d["struct_score"] - 0.5)
+
 
 def buy_signal_champion(d: pd.DataFrame) -> pd.Series:
     buy_base = d["buy_raw"] & (d["zaccel"] >= float(P["zaccel_gate"]))
@@ -378,6 +385,7 @@ def buy_signal_champion(d: pd.DataFrame) -> pd.Series:
         buy_ok = buy_ok & (streak < int(ENTRY_N_DOWN)).fillna(True)
 
     return buy_ok.fillna(False)
+
 
 def simulate_sellraw_only(d: pd.DataFrame, buy_ok: pd.Series) -> pd.DataFrame:
     out = d.copy()
@@ -403,6 +411,70 @@ def simulate_sellraw_only(d: pd.DataFrame, buy_ok: pd.Series) -> pd.DataFrame:
 
 
 # ==========================================================
+# PRIORIDAD 1 — ejecución robusta
+# ==========================================================
+
+def ejecutar_trade_con_retry(
+    signal: str,
+    ts: pd.Timestamp,
+    btc_price: float | None,
+    bnb_price: float | None,
+) -> dict:
+    """
+    Ejecuta route_signal con retry corto.
+    Retorna SIEMPRE un dict canónico.
+    """
+    trade_result = {
+        "status": "NOT_ATTEMPTED",
+        "executed": False,
+        "error": None,
+        "trade_id": None,
+    }
+
+    payload = {
+        "symbol": TRADE_SYMBOL,
+        "side": signal,
+        "context": {
+            "ts": str(ts),
+            "btc_price": btc_price,
+            "bnb_price": bnb_price,
+        }
+    }
+
+    for attempt in range(1, MAX_ROUTE_RETRIES + 1):
+        try:
+            print(f"🔁 [TRADE {TRADE_SYMBOL}] intento {attempt}/{MAX_ROUTE_RETRIES} → {signal}", flush=True)
+
+            trade_result = route_signal(payload)
+
+            print(
+                f"[TRADE {TRADE_SYMBOL}] intento {attempt} resultado: "
+                f"status={trade_result.get('status')} "
+                f"executed={trade_result.get('executed')} "
+                f"trade_id={trade_result.get('trade_id')} "
+                f"error={trade_result.get('error')}",
+                flush=True
+            )
+
+            if bool(trade_result.get("executed", False)) and trade_result.get("status") == "OK":
+                return trade_result
+
+        except Exception as e:
+            trade_result = {
+                "status": "ERROR",
+                "executed": False,
+                "error": str(e),
+                "trade_id": None,
+            }
+            print(f"⚠️ [TRADE {TRADE_SYMBOL}] intento {attempt} excepción: {e}", flush=True)
+
+        if attempt < MAX_ROUTE_RETRIES:
+            time.sleep(ROUTE_RETRY_SLEEP_SEC)
+
+    return trade_result
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
@@ -410,7 +482,7 @@ def main():
     estado_anterior = cargar_estado_anterior()
     estado_actual = {}
 
-    symbol = TRIGGER_SYMBOL  # BTC
+    symbol = TRIGGER_SYMBOL
 
     try:
         print(f"\n===================== TRIGGER {symbol} =====================", flush=True)
@@ -435,12 +507,12 @@ def main():
         sig = simulate_sellraw_only(d, buy_ok)
 
         print(
-            f"[WINNER CFG] zaccel_gate={P['zaccel_gate']} zenergy_min={ENTRY_ZENERGY_MIN} k_struct={ENTRY_K_STRUCT} | "
-            f"zenergy_max={zenergy_max:.4f} zaccel_max={zaccel_max:.4f}",
+            f"[WINNER CFG] zaccel_gate={P['zaccel_gate']} zenergy_min={ENTRY_ZENERGY_MIN} "
+            f"k_struct={ENTRY_K_STRUCT} | zenergy_max={zenergy_max:.4f} zaccel_max={zaccel_max:.4f}",
             flush=True
         )
 
-        # 3) La vela “a evaluar” es la ÚLTIMA cerrada en Sheets (ts_last)
+        # 3) La vela “a evaluar” es la última cerrada
         ts = ts_last
         if ts not in sig.index:
             print(f"⚠️ [{symbol}] No encontré ts exacto en winner signals: {ts}", flush=True)
@@ -453,7 +525,7 @@ def main():
 
         btc_price = float(d.loc[ts, "Close"])
 
-        # 4) Precio BNB desde Sheets (última vela cerrada)
+        # 4) Precio BNB desde Sheets
         bnb_price = None
         try:
             bnb_ohlcv = _wait_trade_sheet_at_least(TRADE_SYMBOL, ts)
@@ -480,58 +552,54 @@ def main():
         # 6) Ejecutar/enviar
         if debe_enviar:
             emoji = "🟢" if signal == "BUY" else "🔴"
-        
+
             mensaje = (
                 f"{emoji} {signal} TRIGGER {symbol} → TRADE {TRADE_SYMBOL}\n"
                 f"📌 Trigger price ({symbol}): {btc_price:,.4f}\n"
             )
             if bnb_price is not None:
                 mensaje += f"💰 Trade price ({TRADE_SYMBOL}): {bnb_price:,.4f}\n"
-        
+
             ts_cr = ts.tz_convert(CR)
             mensaje += (
                 f"🕒 {ts_cr.isoformat()}\n"
-                f"⚙️ winner: zaccel_gate={P['zaccel_gate']} zenergy_min={ENTRY_ZENERGY_MIN} k_struct={ENTRY_K_STRUCT}\n"
+                f"⚙️ winner: zaccel_gate={P['zaccel_gate']} "
+                f"zenergy_min={ENTRY_ZENERGY_MIN} "
+                f"k_struct={ENTRY_K_STRUCT}\n"
             )
-        
+
             enviar_mensaje_telegram(mensaje)
-        
-            trade_result = {
-                "status": "NOT_ATTEMPTED",
-                "executed": False,
-                "error": None,
-            }
-        
-            try:
-                trade_result = route_signal({
-                    "symbol": TRADE_SYMBOL,
-                    "side": signal,
-                    "context": {
-                        "ts": str(ts),
-                        "btc_price": btc_price,
-                        "bnb_price": bnb_price,
-                    }
-                })
-                print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado {signal}: {trade_result}", flush=True)
-            except Exception as e:
-                trade_result = {
-                    "status": "ERROR",
-                    "executed": False,
-                    "error": str(e),
-                }
-                print(f"⚠️ [TRADE {TRADE_SYMBOL}] Error {signal} (route_signal): {e}", flush=True)
-        
-            # ✅ SOLO commit del estado si el trade realmente se ejecutó
+
+            trade_result = ejecutar_trade_con_retry(
+                signal=signal,
+                ts=ts,
+                btc_price=btc_price,
+                bnb_price=bnb_price,
+            )
+
+            print(f"[TRADE {TRADE_SYMBOL}] ✅ Resultado final {signal}: {trade_result}", flush=True)
+
+            # Commit SOLO si el trade realmente se ejecutó
             if bool(trade_result.get("executed", False)) and trade_result.get("status") == "OK":
                 estado_actual[symbol] = {"signal": signal, "last_close_ms": last_close_ms}
                 print(f"✅ [STATE] Commit de estado por ejecución real: {signal}", flush=True)
             else:
-                # avanzamos la vela, pero NO consumimos la señal como ejecutada
                 estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
                 print(
                     f"⚠️ [STATE] Sin commit de señal. "
-                    f"trade_result.status={trade_result.get('status')} executed={trade_result.get('executed')}",
+                    f"trade_result.status={trade_result.get('status')} "
+                    f"executed={trade_result.get('executed')}",
                     flush=True
+                )
+
+                enviar_alerta_critica_trade(
+                    signal=signal,
+                    trigger_symbol=symbol,
+                    trade_symbol=TRADE_SYMBOL,
+                    trigger_price=btc_price,
+                    trade_price=bnb_price,
+                    ts=ts,
+                    trade_result=trade_result,
                 )
         else:
             estado_actual[symbol] = {"signal": prev_signal, "last_close_ms": last_close_ms}
