@@ -379,24 +379,64 @@ def _result(
 # 4) BINANCE MARGIN HELPERS
 # =============================================================
 
+
+_MARGIN_ACCOUNT_CACHE = {
+    "ts": 0.0,
+    "data": None,
+}
+
+MARGIN_ACCOUNT_CACHE_TTL_SEC = float(os.getenv("MARGIN_ACCOUNT_CACHE_TTL_SEC", "2.0"))
+
+def _get_margin_account_snapshot(client, force: bool = False) -> Dict[str, Any]:
+    """
+    Devuelve un snapshot reciente de cross margin account.
+    Usa un cache corto para evitar múltiples llamadas REST dentro
+    del mismo ciclo de ejecución.
+    """
+    global _MARGIN_ACCOUNT_CACHE
+
+    now = time.time()
+
+    if (
+        not force
+        and _MARGIN_ACCOUNT_CACHE["data"] is not None
+        and (now - _MARGIN_ACCOUNT_CACHE["ts"]) <= MARGIN_ACCOUNT_CACHE_TTL_SEC
+    ):
+        return _MARGIN_ACCOUNT_CACHE["data"]
+
+    data = client.get_margin_account()
+    _MARGIN_ACCOUNT_CACHE["ts"] = now
+    _MARGIN_ACCOUNT_CACHE["data"] = data
+    return data
+
+def _invalidate_margin_account_snapshot() -> None:
+    """
+    Invalida el cache local. Útil después de una orden, borrow o repay,
+    porque el estado real de la cuenta cambió.
+    """
+    global _MARGIN_ACCOUNT_CACHE
+    _MARGIN_ACCOUNT_CACHE["ts"] = 0.0
+    _MARGIN_ACCOUNT_CACHE["data"] = None
+
+
 def _get_margin_account(client) -> Dict[str, Any]:
     return client.get_margin_account()
 
-def _get_margin_level(client) -> float:
-    acc = _get_margin_account(client)
+def _get_margin_level(client, account_snapshot: Optional[Dict[str, Any]] = None) -> float:
+    acc = account_snapshot or _get_margin_account_snapshot(client)
     assets = float(acc.get("totalAssetOfBtc", 0) or 0)
     liab   = float(acc.get("totalLiabilityOfBtc", 0) or 0)
     return 99.0 if liab == 0 else assets / liab
 
-def _get_margin_free_usdt(client) -> float:
-    acc = _get_margin_account(client)
+def _get_margin_free_usdt(client, account_snapshot: Optional[Dict[str, Any]] = None) -> float:
+    acc = account_snapshot or _get_margin_account_snapshot(client)
     for a in acc.get("userAssets", []):
         if a.get("asset") == "USDT":
             return float(a.get("free", 0) or 0)
     return 0.0
 
-def _get_margin_free_asset(client, asset: str) -> float:
-    acc = _get_margin_account(client)
+def _get_margin_free_asset(client, asset: str, account_snapshot: Optional[Dict[str, Any]] = None) -> float:
+    acc = account_snapshot or _get_margin_account_snapshot(client)
     for a in acc.get("userAssets", []):
         if a.get("asset") == asset:
             return float(a.get("free", 0) or 0)
@@ -435,8 +475,12 @@ def _get_max_borrowable_usdt(client) -> Dict[str, Any]:
 
     return out
 
-def _get_margin_equity_usdt(client, btc_price_from_context: Optional[float]) -> float:
-    acc = _get_margin_account(client)
+def _get_margin_equity_usdt(
+    client,
+    btc_price_from_context: Optional[float],
+    account_snapshot: Optional[Dict[str, Any]] = None
+) -> float:
+    acc = account_snapshot or _get_margin_account_snapshot(client)
     btc_equity = float(acc.get("totalNetAssetOfBtc", 0) or 0)
 
     if btc_price_from_context and btc_price_from_context > 0:
@@ -467,7 +511,8 @@ def _round_step(value: float, step: float) -> float:
     return float(rounded)
 
 def _borrow_usdt_if_needed(client, required_usdt: float) -> Dict[str, Any]:
-    free = _get_margin_free_usdt(client)
+    acc = _get_margin_account_snapshot(client, force=True)
+    free = _get_margin_free_usdt(client, account_snapshot=acc)
     missing = max(0.0, required_usdt - free)
 
     max_borrow_info = _get_max_borrowable_usdt(client)
@@ -507,8 +552,10 @@ def _borrow_usdt_if_needed(client, required_usdt: float) -> Dict[str, Any]:
             "free_before": free,
             "max_borrowable": max_borrowable,
         }
-
+    #
     res = client.create_margin_loan(asset="USDT", amount=str(missing_clean))
+    _invalidate_margin_account_snapshot()
+    
     return {
         "status": "BORROWED",
         "amount": missing_clean,
@@ -517,8 +564,9 @@ def _borrow_usdt_if_needed(client, required_usdt: float) -> Dict[str, Any]:
         "response": res,
     }
 
-def _repay_all_usdt(client) -> Dict[str, Any]:
-    acc = _get_margin_account(client)
+def _repay_all_usdt(client, account_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    acc = account_snapshot or _get_margin_account_snapshot(client)
+
     borrowed = 0.0
     interest = 0.0
     for a in acc.get("userAssets", []):
@@ -537,24 +585,38 @@ def _repay_all_usdt(client) -> Dict[str, Any]:
     if DRY_RUN:
         return {"status": "DRY_RUN_REPAY", "debt": debt_clean}
 
-    return client.repay_margin_loan(asset="USDT", amount=str(debt_clean))
+    res = client.repay_margin_loan(asset="USDT", amount=str(debt_clean))
+
+    # El repay cambia el estado real de la cuenta
+    _invalidate_margin_account_snapshot()
+
+    return res
 
 def _wait_margin_free_usdt(client, min_required: float, tries: int, sleep_s: float) -> float:
     best = 0.0
     for i in range(1, tries + 1):
-        free = _get_margin_free_usdt(client)
+        acc = _get_margin_account_snapshot(client, force=True)
+        free = _get_margin_free_usdt(client, account_snapshot=acc)
         best = max(best, free)
-        print(f"⏳ [MARGIN] balance check {i}/{tries} → free_usdt={free:.6f} required={min_required:.6f}", flush=True)
+
+        print(
+            f"⏳ [MARGIN] balance check {i}/{tries} → "
+            f"free_usdt={free:.6f} required={min_required:.6f}",
+            flush=True
+        )
+
         if free >= min_required:
             return free
+
         time.sleep(sleep_s)
+
     return best
 
 def _margin_buy_quote(client, symbol: str, quote_usdt: float) -> Dict[str, Any]:
     if DRY_RUN:
         return {"status": "DRY_RUN", "cummulativeQuoteQty": quote_usdt, "executedQty": 0}
 
-    return client.create_margin_order(
+    res = client.create_margin_order(
         symbol=symbol,
         side="BUY",
         type="MARKET",
@@ -562,17 +624,23 @@ def _margin_buy_quote(client, symbol: str, quote_usdt: float) -> Dict[str, Any]:
         isIsolated="FALSE",
     )
 
+    _invalidate_margin_account_snapshot()
+    return res
+
 def _margin_sell_qty(client, symbol: str, qty: float) -> Dict[str, Any]:
     if DRY_RUN:
         return {"status": "DRY_RUN", "executedQty": qty, "cummulativeQuoteQty": 0}
 
-    return client.create_margin_order(
+    res = client.create_margin_order(
         symbol=symbol,
         side="SELL",
         type="MARKET",
         quantity=str(qty),
         isIsolated="FALSE",
     )
+
+    _invalidate_margin_account_snapshot()
+    return res
 
 # =============================================================
 # 5) RECONCILIATION / POSITION STATE
@@ -581,7 +649,11 @@ def _margin_sell_qty(client, symbol: str, qty: float) -> Dict[str, Any]:
 def _asset_from_symbol(symbol: str) -> str:
     return symbol.replace("USDT", "").strip().upper()
 
-def get_margin_position_state(symbol: str) -> dict:
+def get_margin_position_state(
+    symbol: str,
+    client=None,
+    account_snapshot: Optional[Dict[str, Any]] = None
+) -> dict:
     """
     Lee el estado REAL de la cuenta cross margin para el símbolo dado.
 
@@ -596,7 +668,9 @@ def get_margin_position_state(symbol: str) -> dict:
       - error / ok
     """
     try:
-        client = get_client()
+        if client is None:
+            client = get_client()
+
         if client is None:
             init_err = get_last_init_error()
             print(f"❌ [RECON] get_client() returned None | init_err={init_err}", flush=True)
@@ -615,7 +689,7 @@ def get_margin_position_state(symbol: str) -> dict:
                 "error": f"get_client() returned None | init_err={init_err}",
             }
 
-        acct = client.get_margin_account()
+        acct = account_snapshot or _get_margin_account_snapshot(client)
         assets = acct.get("userAssets", []) or []
 
         base_asset = _asset_from_symbol(symbol)
@@ -706,8 +780,13 @@ def get_margin_position_state(symbol: str) -> dict:
             "margin_level": None,
             "error": str(e),
         }
-
-def get_margin_operational_state(symbol: str, trade_mode: str = "MARGIN") -> Dict[str, Any]:
+        
+def get_margin_operational_state(
+    symbol: str,
+    trade_mode: str = "MARGIN",
+    client=None,
+    account_snapshot: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Combina:
       - estado REAL en Binance (posición margin)
@@ -715,7 +794,47 @@ def get_margin_operational_state(symbol: str, trade_mode: str = "MARGIN") -> Dic
 
     y devuelve una evaluación de consistencia operativa.
     """
-    recon = get_margin_position_state(symbol)
+    if client is None:
+        client = get_client()
+
+    if client is None:
+        init_err = get_last_init_error()
+        recon = {
+            "ok": False,
+            "status": "NO_CLIENT",
+            "symbol": symbol,
+            "asset": _asset_from_symbol(symbol),
+            "has_position": False,
+            "free_qty": 0.0,
+            "net_asset_qty": 0.0,
+            "borrowed_base": 0.0,
+            "free_usdt": 0.0,
+            "borrowed_usdt": 0.0,
+            "margin_level": None,
+            "error": f"get_client() returned None | init_err={init_err}",
+        }
+        sheet = get_sheet_open_trade_state(symbol, trade_mode=trade_mode)
+        return {
+            "ok": False,
+            "status": "RECON_FAILED",
+            "symbol": symbol,
+            "has_position": False,
+            "has_open_trade": False,
+            "consistent": False,
+            "mismatch_reason": "RECON_FAILED",
+            "recon": recon,
+            "sheet": sheet,
+            "error": recon.get("error"),
+        }
+
+    if account_snapshot is None:
+        account_snapshot = _get_margin_account_snapshot(client, force=True)
+
+    recon = get_margin_position_state(
+        symbol,
+        client=client,
+        account_snapshot=account_snapshot
+    )
     sheet = get_sheet_open_trade_state(symbol, trade_mode=trade_mode)
 
     if not recon.get("ok", False):
@@ -786,6 +905,33 @@ def get_margin_operational_state(symbol: str, trade_mode: str = "MARGIN") -> Dic
 
     return out
 
+def get_margin_operational_state_fresh(
+    symbol: str,
+    trade_mode: str = "MARGIN"
+) -> Dict[str, Any]:
+    """
+    Wrapper conveniente para reconciliación fresca:
+    obtiene client, toma un snapshot único y lo reutiliza
+    en toda la evaluación operativa.
+    """
+    client = get_client()
+    if client is None:
+        return get_margin_operational_state(
+            symbol=symbol,
+            trade_mode=trade_mode,
+            client=None,
+            account_snapshot=None
+        )
+
+    account_snapshot = _get_margin_account_snapshot(client, force=True)
+
+    return get_margin_operational_state(
+        symbol=symbol,
+        trade_mode=trade_mode,
+        client=client,
+        account_snapshot=account_snapshot
+    )
+
 # =============================================================
 # 6) ENTRYPOINT MARGIN
 # =============================================================
@@ -822,15 +968,29 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
         if side == "BUY":
             base_row = _trade_row_base(trade_id, symbol, side, context)
 
-            mlevel = _get_margin_level(client)
+            # =====================================================
+            # SNAPSHOT ÚNICO INICIAL DEL BUY
+            # =====================================================
+            account_snapshot = _get_margin_account_snapshot(client, force=True)
+
+            mlevel = _get_margin_level(client, account_snapshot=account_snapshot)
             print(f"📊 [MARGIN] margin_level={mlevel:.2f} (min={MIN_MARGIN_LEVEL})", flush=True)
             if mlevel < MIN_MARGIN_LEVEL:
                 row = {**base_row, "status": f"REJECTED:RISK_MARGIN_LEVEL:{mlevel:.4f}"}
                 _append_trade_row(row)
-                return _result("RISK_MARGIN_LEVEL", executed=False, trade_id=trade_id, detail={"margin_level": mlevel})
-            ## new change starts here
+                return _result(
+                    "RISK_MARGIN_LEVEL",
+                    executed=False,
+                    trade_id=trade_id,
+                    detail={"margin_level": mlevel}
+                )
+
             btc_price = context.get("btc_price", None)
-            equity_usdt = _get_margin_equity_usdt(client, btc_price)
+            equity_usdt = _get_margin_equity_usdt(
+                client,
+                btc_price,
+                account_snapshot=account_snapshot
+            )
             if equity_usdt <= 0:
                 row = {**base_row, "status": "REJECTED:NO_MARGIN_COLLATERAL"}
                 _append_trade_row(row)
@@ -841,7 +1001,9 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                     detail={"equity_usdt": equity_usdt}
                 )
 
-            free_usdt = _get_margin_free_usdt(client)
+            free_usdt = _get_margin_free_usdt(client, account_snapshot=account_snapshot)
+
+            # maxBorrowable sigue siendo llamada separada (no sale de margin account)
             max_borrow_info = _get_max_borrowable_usdt(client)
             max_borrowable = float(max_borrow_info.get("max_borrowable", 0.0) or 0.0)
 
@@ -910,77 +1072,20 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                         "capped_target": capped_target,
                     }
                 )
-            ## ends here
-
-            free_after = _wait_margin_free_usdt(
-                client,
-                min_required=safe,
-                tries=POST_BORROW_POLL_TRIES,
-                sleep_s=POST_BORROW_POLL_SLEEP
-            )
-
-            buy_quote = _round_usdt_2(min(safe, free_after * float(POST_BORROW_BUY_BUFFER)))
-
-            print(
-                f"🧱 [MARGIN] free_after={free_after:.6f} "
-                f"buy_quote={buy_quote:.2f} buffer={POST_BORROW_BUY_BUFFER}",
-                flush=True
-            )
-
-            if buy_quote < min_required:
-                if borrowed:
-                    try:
-                        _repay_all_usdt(client)
-                    except Exception as repay_err:
-                        print(f"⚠️ [MARGIN] repay tras BUY fallido (pre-order) falló: {repay_err}", flush=True)
-
-                row = {**base_row, "status": f"ERROR:INSUFFICIENT_POST_BORROW_BALANCE:{buy_quote:.2f}"}
-                _append_trade_row(row)
-                return _result(
-                    "ERROR",
-                    executed=False,
-                    error="Insufficient post-borrow balance",
-                    trade_id=trade_id,
-                    detail={"buy_quote": buy_quote, "min_required": min_required}
-                )
-
-            order = _margin_buy_quote(client, symbol, buy_quote)
-            entry_price_real = _extract_fill_price(order, fallback_price=context.get("bnb_price"))
-
-            row = {
-                **base_row,
-                "qty": float(order.get("executedQty", 0) or 0),
-                "entry_price": "" if entry_price_real is None else entry_price_real,
-                "entry_time": _utcnow_iso(),
-                "status": "OPEN",
-                "trade_mode": "MARGIN",
-            }
-            _append_trade_row(row)
-            #
-            return _result(
-                "OK",
-                executed=True,
-                order=order,
-                trade_id=trade_id,
-                detail={
-                    "buy_quote": buy_quote,
-                    "free_usdt": free_usdt,
-                    "max_borrowable": max_borrowable,
-                    "theoretical_target": theoretical_target,
-                    "capped_target": capped_target,
-                    "capped_by_borrow_limit": capped_by_borrow_limit,
-                }
-            )
-            #
-
+        
         elif side == "SELL":
+            # =====================================================
+            # SNAPSHOT ÚNICO INICIAL DEL SELL
+            # =====================================================
+            account_snapshot = _get_margin_account_snapshot(client, force=True)
+        
             asset = _asset_from_symbol(symbol)
-            qty_avail = _get_margin_free_asset(client, asset)
+            qty_avail = _get_margin_free_asset(client, asset, account_snapshot=account_snapshot)
             print(f"ℹ️ [MARGIN] {asset} free≈{qty_avail:.8f}", flush=True)
 
             if qty_avail <= 0:
                 try:
-                    _repay_all_usdt(client)
+                    _repay_all_usdt(client, account_snapshot=account_snapshot)
                 except Exception as repay_err:
                     print(f"⚠️ [MARGIN] repay on NO_POSITION failed: {repay_err}", flush=True)
                 return _result("NO_POSITION_MARGIN", executed=False, trade_id=None)
@@ -1002,8 +1107,11 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
 
             order = _margin_sell_qty(client, symbol, qty_clean)
 
+            # Después del sell, el estado cambió; pedir snapshot fresco para repay
+            post_sell_snapshot = _get_margin_account_snapshot(client, force=True)
+
             try:
-                _repay_all_usdt(client)
+                _repay_all_usdt(client, account_snapshot=post_sell_snapshot)
             except Exception as repay_err:
                 print(f"⚠️ [MARGIN] repay tras SELL falló: {repay_err}", flush=True)
 
@@ -1047,29 +1155,3 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 trade_id_to_return = fallback_trade_id
 
             return _result("OK", executed=True, order=order, trade_id=trade_id_to_return)
-
-        return _result("IGNORED", executed=False, detail={"detail": "side inválido"})
-
-    except Exception as e:
-        _mark_banned_from_exception(e)
-
-        if side == "BUY" and borrowed:
-            try:
-                _repay_all_usdt(client)
-            except Exception as repay_err:
-                print(f"⚠️ [MARGIN] repay tras excepción BUY falló: {repay_err}", flush=True)
-
-        print(f"❌ [MARGIN] Error ejecutando: {e}", flush=True)
-
-        err_row = _trade_row_base(trade_id, symbol, side, context)
-        err_row["status"] = f"ERROR:{str(e)[:180]}"
-        err_row["trade_mode"] = "MARGIN"
-        _append_trade_row(err_row)
-
-        return _result(
-            "ERROR",
-            executed=False,
-            error=str(e),
-            trade_id=trade_id,
-            detail={"banned_until_ms": _BANNED_UNTIL_MS or None}
-        )
