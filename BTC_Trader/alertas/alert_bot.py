@@ -25,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.load_from_sheets import load_symbol_df
 from utils.trade_executor_router import route_signal
-from utils.trade_executor_margin import get_margin_operational_state
+from utils.trade_executor_margin import get_margin_operational_state_fresh
 from signal_tracker import cargar_estado_anterior, guardar_estado_actual
 
 
@@ -171,11 +171,11 @@ def evaluar_reconciliacion_pre_trade(signal: str, symbol: str) -> dict:
 
     Reglas:
       1) si no se puede leer Binance/Sheets -> BLOCK
-      2) si Binance y Sheets no cuadran       -> BLOCK
-      3) BUY  + ya hay posición real         -> BLOCK
-      4) SELL + no hay posición real         -> BLOCK
+      2) si Binance y Sheets no cuadran     -> BLOCK
+      3) BUY  + ya hay posición real        -> BLOCK
+      4) SELL + no hay posición real        -> BLOCK
     """
-    oper = get_margin_operational_state(symbol)
+    oper = get_margin_operational_state_fresh(symbol)
 
     if not oper.get("ok", False):
         return {
