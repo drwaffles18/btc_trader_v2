@@ -1072,13 +1072,13 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                         "capped_target": capped_target,
                     }
                 )
-        
+        #
         elif side == "SELL":
             # =====================================================
             # SNAPSHOT ÚNICO INICIAL DEL SELL
             # =====================================================
             account_snapshot = _get_margin_account_snapshot(client, force=True)
-        
+
             asset = _asset_from_symbol(symbol)
             qty_avail = _get_margin_free_asset(client, asset, account_snapshot=account_snapshot)
             print(f"ℹ️ [MARGIN] {asset} free≈{qty_avail:.8f}", flush=True)
@@ -1155,3 +1155,23 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
                 trade_id_to_return = fallback_trade_id
 
             return _result("OK", executed=True, order=order, trade_id=trade_id_to_return)
+
+        return _result("IGNORED", executed=False, detail={"detail": "side inválido"})
+
+    except Exception as e:
+        print(f"❌ [MARGIN] Error ejecutando: {e}", flush=True)
+
+        # rollback defensivo: intentar repay si hubo borrow
+        if borrowed:
+            try:
+                print("↩️ [MARGIN] rollback → intentando repay tras error", flush=True)
+                _repay_all_usdt(client)
+            except Exception as repay_err:
+                print(f"⚠️ [MARGIN] rollback repay falló: {repay_err}", flush=True)
+
+        return _result(
+            "ERROR",
+            executed=False,
+            error=str(e),
+            trade_id=trade_id
+        )
