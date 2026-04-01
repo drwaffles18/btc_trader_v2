@@ -68,6 +68,24 @@ def _mark_banned_from_exception(e: Exception) -> None:
 def _ban_active() -> bool:
     return _now_ms() < _BANNED_UNTIL_MS
 
+def _seconds_to_ban_release() -> int:
+    return max(0, int((_BANNED_UNTIL_MS - _now_ms()) / 1000))
+
+def _error_looks_like_ban(msg: str) -> bool:
+    s = str(msg or "")
+    s_low = s.lower()
+    return (
+        "code=-1003" in s
+        or "ip banned" in s_low
+        or "way too much request weight" in s_low
+        or "too much request weight" in s_low
+        or "banned until" in s_low
+    )
+
+def _ban_error_text_from_state() -> str:
+    secs = _seconds_to_ban_release()
+    return f"Binance ban active | retry_after_sec={secs} | until_ms={_BANNED_UNTIL_MS}"
+
 # =============================================================
 # 2) SHEETS Trades (lazy-safe)
 # =============================================================
@@ -910,20 +928,199 @@ def get_margin_operational_state_fresh(
     trade_mode: str = "MARGIN"
 ) -> Dict[str, Any]:
     """
-    Wrapper conveniente para reconciliación fresca:
-    obtiene client, toma un snapshot único y lo reutiliza
-    en toda la evaluación operativa.
-    """
-    client = get_client()
-    if client is None:
-        return get_margin_operational_state(
-            symbol=symbol,
-            trade_mode=trade_mode,
-            client=None,
-            account_snapshot=None
-        )
+    Wrapper conveniente para reconciliación operativa.
 
-    account_snapshot = _get_margin_account_snapshot(client, force=True)
+    Cambios:
+    - Si hay ban activo, no intenta pegarle a Binance.
+    - Si get_client() falla por -1003, marca ban local y devuelve estado BANNED.
+    - Usa snapshot cacheado por defecto para bajar REST weight.
+    """
+    # ---------------------------------------------------------
+    # 1) Si ya sabemos que estamos baneados, no tocar Binance
+    # ---------------------------------------------------------
+    if _ban_active():
+        err = _ban_error_text_from_state()
+        print(f"⛔ [OPER_STATE] BANNED_ACTIVE {symbol} | {err}", flush=True)
+        return {
+            "ok": False,
+            "status": "BANNED",
+            "symbol": symbol,
+            "has_position": False,
+            "has_open_trade": False,
+            "open_count": None,
+            "consistent": False,
+            "mismatch_reason": "RECON_FAILED",
+            "recon": {
+                "ok": False,
+                "status": "BANNED",
+                "symbol": symbol,
+                "has_position": False,
+                "free_qty": 0.0,
+                "net_asset_qty": 0.0,
+                "borrowed_usdt": 0.0,
+                "margin_level": None,
+                "error": err,
+            },
+            "sheet": {
+                "ok": False,
+                "status": "SKIPPED_DUE_TO_BAN",
+                "symbol": symbol,
+                "trade_mode": trade_mode,
+                "has_open_trade": False,
+                "open_count": None,
+                "last_open_trade": None,
+                "error": err,
+            },
+            "error": err,
+        }
+
+    # ---------------------------------------------------------
+    # 2) Intentar obtener client
+    # ---------------------------------------------------------
+    try:
+        client = get_client()
+        if client is None:
+            init_err = get_last_init_error()
+
+            if _error_looks_like_ban(init_err):
+                _mark_banned_from_exception(Exception(init_err))
+                err = f"get_client() returned None | init_err={init_err}"
+                print(f"⛔ [OPER_STATE] NO_CLIENT→BANNED {symbol} | {err}", flush=True)
+                return {
+                    "ok": False,
+                    "status": "BANNED",
+                    "symbol": symbol,
+                    "has_position": False,
+                    "has_open_trade": False,
+                    "open_count": None,
+                    "consistent": False,
+                    "mismatch_reason": "RECON_FAILED",
+                    "recon": {
+                        "ok": False,
+                        "status": "BANNED",
+                        "symbol": symbol,
+                        "has_position": False,
+                        "free_qty": 0.0,
+                        "net_asset_qty": 0.0,
+                        "borrowed_usdt": 0.0,
+                        "margin_level": None,
+                        "error": err,
+                    },
+                    "sheet": {
+                        "ok": False,
+                        "status": "SKIPPED_DUE_TO_BAN",
+                        "symbol": symbol,
+                        "trade_mode": trade_mode,
+                        "has_open_trade": False,
+                        "open_count": None,
+                        "last_open_trade": None,
+                        "error": err,
+                    },
+                    "error": err,
+                }
+
+            return get_margin_operational_state(
+                symbol=symbol,
+                trade_mode=trade_mode,
+                client=None,
+                account_snapshot=None
+            )
+
+    except Exception as e:
+        _mark_banned_from_exception(e)
+        if _ban_active() or _error_looks_like_ban(str(e)):
+            err = f"get_client() exception | {e}"
+            print(f"⛔ [OPER_STATE] EXCEPTION→BANNED {symbol} | {err}", flush=True)
+            return {
+                "ok": False,
+                "status": "BANNED",
+                "symbol": symbol,
+                "has_position": False,
+                "has_open_trade": False,
+                "open_count": None,
+                "consistent": False,
+                "mismatch_reason": "RECON_FAILED",
+                "recon": {
+                    "ok": False,
+                    "status": "BANNED",
+                    "symbol": symbol,
+                    "has_position": False,
+                    "free_qty": 0.0,
+                    "net_asset_qty": 0.0,
+                    "borrowed_usdt": 0.0,
+                    "margin_level": None,
+                    "error": err,
+                },
+                "sheet": {
+                    "ok": False,
+                    "status": "SKIPPED_DUE_TO_BAN",
+                    "symbol": symbol,
+                    "trade_mode": trade_mode,
+                    "has_open_trade": False,
+                    "open_count": None,
+                    "last_open_trade": None,
+                    "error": err,
+                },
+                "error": err,
+            }
+
+        return {
+            "ok": False,
+            "status": "OPER_STATE_FAILED",
+            "symbol": symbol,
+            "has_position": False,
+            "has_open_trade": False,
+            "open_count": None,
+            "consistent": False,
+            "mismatch_reason": "RECON_FAILED",
+            "recon": {},
+            "sheet": {},
+            "error": str(e),
+        }
+
+    # ---------------------------------------------------------
+    # 3) Snapshot NO forzado para bajar peso REST
+    # ---------------------------------------------------------
+    try:
+        account_snapshot = _get_margin_account_snapshot(client, force=False)
+    except Exception as e:
+        _mark_banned_from_exception(e)
+        if _ban_active() or _error_looks_like_ban(str(e)):
+            err = f"margin snapshot failed | {e}"
+            print(f"⛔ [OPER_STATE] SNAPSHOT→BANNED {symbol} | {err}", flush=True)
+            return {
+                "ok": False,
+                "status": "BANNED",
+                "symbol": symbol,
+                "has_position": False,
+                "has_open_trade": False,
+                "open_count": None,
+                "consistent": False,
+                "mismatch_reason": "RECON_FAILED",
+                "recon": {
+                    "ok": False,
+                    "status": "BANNED",
+                    "symbol": symbol,
+                    "has_position": False,
+                    "free_qty": 0.0,
+                    "net_asset_qty": 0.0,
+                    "borrowed_usdt": 0.0,
+                    "margin_level": None,
+                    "error": err,
+                },
+                "sheet": {
+                    "ok": False,
+                    "status": "SKIPPED_DUE_TO_BAN",
+                    "symbol": symbol,
+                    "trade_mode": trade_mode,
+                    "has_open_trade": False,
+                    "open_count": None,
+                    "last_open_trade": None,
+                    "error": err,
+                },
+                "error": err,
+            }
+        raise
 
     return get_margin_operational_state(
         symbol=symbol,
@@ -946,10 +1143,20 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
     if STRICT_TRADE_SYMBOL and symbol != TRADE_SYMBOL:
         print(f"⛔ [MARGIN] IGNORE → {symbol} != TRADE_SYMBOL {TRADE_SYMBOL}", flush=True)
         return _result("IGNORED_SYMBOL", executed=False, detail={"symbol": symbol, "trade_symbol": TRADE_SYMBOL})
-
+    #
     if _ban_active():
-        print(f"⛔ [MARGIN] BANNED_ACTIVE until_ms={_BANNED_UNTIL_MS}", flush=True)
-        return _result("BANNED", executed=False, detail={"until_ms": _BANNED_UNTIL_MS})
+        err = _ban_error_text_from_state()
+        print(f"⛔ [MARGIN] BANNED_ACTIVE {symbol} | {err}", flush=True)
+        return _result(
+            "BANNED",
+            executed=False,
+            error=err,
+            detail={
+                "until_ms": _BANNED_UNTIL_MS,
+                "retry_after_sec": _seconds_to_ban_release(),
+                "symbol": symbol,
+            }
+        )
 
     try:
         client = get_client()
