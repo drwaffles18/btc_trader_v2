@@ -21,7 +21,13 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional
 
 from utils.google_client import get_gsheet_client
-from utils.binance_session import get_client, get_last_init_error
+from utils.binance_session import (
+    get_client,
+    get_last_init_error,
+    ban_active,
+    get_banned_until_ms,
+    get_retry_after_sec,
+)
 
 # =============================================================
 # 0) ENV
@@ -498,24 +504,66 @@ def _get_margin_equity_usdt(
     btc_price_from_context: Optional[float],
     account_snapshot: Optional[Dict[str, Any]] = None
 ) -> float:
+    """
+    Convierte equity BTC→USDT usando el precio que ya viene desde Sheets/context.
+    Evitamos ticker REST aquí para no gastar weight.
+
+    Si no viene btc_price_from_context, devolvemos 0.0 para bloquear BUY de forma segura.
+    """
     acc = account_snapshot or _get_margin_account_snapshot(client)
     btc_equity = float(acc.get("totalNetAssetOfBtc", 0) or 0)
 
-    if btc_price_from_context and btc_price_from_context > 0:
+    if btc_price_from_context and float(btc_price_from_context) > 0:
         return btc_equity * float(btc_price_from_context)
 
-    t = client.get_symbol_ticker(symbol="BTCUSDT")
-    btc_price = float(t.get("price", 0) or 0)
-    return btc_equity * btc_price
+    print("⚠️ [MARGIN] btc_price_from_context ausente o inválido → equity_usdt=0.0", flush=True)
+    return 0.0
 
-def _get_symbol_filters(client, symbol: str) -> Dict[str, float]:
-    info = client.get_symbol_info(symbol)
+def _get_symbol_filters(client, symbol: str, force_refresh: bool = False) -> Dict[str, float]:
+    """
+    Cachea stepSize y minNotional por símbolo para evitar get_symbol_info()
+    en cada trade. Estas reglas cambian rarísimo.
+    """
+    global _SYMBOL_FILTERS_CACHE
+
+    sym = (symbol or "").strip().upper()
+    now = time.time()
+
+    cached = _SYMBOL_FILTERS_CACHE.get(sym)
+    if (
+        not force_refresh
+        and cached is not None
+        and (now - cached["ts"]) <= _SYMBOL_FILTERS_TTL_SEC
+    ):
+        return cached["data"]
+
+    info = client.get_symbol_info(sym)
     filters = {f["filterType"]: f for f in info.get("filters", [])}
+
     lot = filters.get("LOT_SIZE", {}) or {}
-    min_notional = filters.get("MIN_NOTIONAL", {}) or {}
+    mnf = filters.get("MIN_NOTIONAL", {}) or {}
+
     step = float(lot.get("stepSize", 0) or 0)
-    mn   = float(min_notional.get("minNotional", BINANCE_NOTIONAL_FLOOR) or BINANCE_NOTIONAL_FLOOR)
-    return {"step": step, "min_notional": mn}
+    min_notional = float(
+        mnf.get("minNotional", BINANCE_NOTIONAL_FLOOR) or BINANCE_NOTIONAL_FLOOR
+    )
+
+    out = {
+        "step": step,
+        "min_notional": min_notional,
+    }
+
+    _SYMBOL_FILTERS_CACHE[sym] = {
+        "ts": now,
+        "data": out,
+    }
+
+    print(
+        f"🧩 [MARGIN] symbol filters loaded {sym} | step={step} min_notional={min_notional}",
+        flush=True
+    )
+
+    return out
 
 def _round_step(value: float, step: float) -> float:
     if step == 0:
@@ -659,6 +707,9 @@ def _margin_sell_qty(client, symbol: str, qty: float) -> Dict[str, Any]:
 
     _invalidate_margin_account_snapshot()
     return res
+
+_SYMBOL_FILTERS_CACHE = {}
+_SYMBOL_FILTERS_TTL_SEC = float(os.getenv("SYMBOL_FILTERS_TTL_SEC", "21600"))  # 6h
 
 # =============================================================
 # 5) RECONCILIATION / POSITION STATE
@@ -1144,26 +1195,49 @@ def handle_margin_signal(symbol: str, side: str, context: Optional[Dict[str, Any
         print(f"⛔ [MARGIN] IGNORE → {symbol} != TRADE_SYMBOL {TRADE_SYMBOL}", flush=True)
         return _result("IGNORED_SYMBOL", executed=False, detail={"symbol": symbol, "trade_symbol": TRADE_SYMBOL})
     #
-    if _ban_active():
-        err = _ban_error_text_from_state()
+    if _ban_active() or ban_active():
+        until_ms = _BANNED_UNTIL_MS if _ban_active() else get_banned_until_ms()
+        retry_after = max(0, int((until_ms - _now_ms()) / 1000)) if until_ms else get_retry_after_sec()
+    
+        err = f"Binance ban active | retry_after_sec={retry_after} | until_ms={until_ms}"
         print(f"⛔ [MARGIN] BANNED_ACTIVE {symbol} | {err}", flush=True)
         return _result(
             "BANNED",
             executed=False,
             error=err,
             detail={
-                "until_ms": _BANNED_UNTIL_MS,
-                "retry_after_sec": _seconds_to_ban_release(),
+                "until_ms": until_ms,
+                "retry_after_sec": retry_after,
                 "symbol": symbol,
             }
         )
-
+    #
     try:
         client = get_client()
         if client is None:
             init_err = get_last_init_error()
-            print(f"❌ [MARGIN] get_client() returned None | init_err={init_err}", flush=True)
-            return _result("NO_CLIENT", executed=False, error=f"get_client() returned None | init_err={init_err}")
+    
+            if ban_active():
+                err = (
+                    f"Binance ban active | retry_after_sec={get_retry_after_sec()} "
+                    f"| until_ms={get_banned_until_ms()} | init_err={init_err}"
+                )
+                print(f"⛔ [MARGIN] {err}", flush=True)
+                return _result(
+                    "BANNED",
+                    executed=False,
+                    error=err,
+                    detail={
+                        "until_ms": get_banned_until_ms(),
+                        "retry_after_sec": get_retry_after_sec(),
+                        "symbol": symbol,
+                    }
+                )
+    
+            err = f"get_client() returned None | init_err={init_err}"
+            print(f"❌ [MARGIN] {err}", flush=True)
+            return _result("NO_CLIENT", executed=False, error=err)
+    
     except Exception as e:
         print(f"❌ [MARGIN] No pude obtener client: {e}", flush=True)
         return _result("NO_CLIENT", executed=False, error=str(e))
