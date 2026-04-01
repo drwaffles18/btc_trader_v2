@@ -502,6 +502,35 @@ def simulate_sellraw_only(d: pd.DataFrame, buy_ok: pd.Series) -> pd.DataFrame:
 # PRIORIDAD 1 — ejecución robusta
 # ==========================================================
 
+def _looks_like_non_retryable_trade_result(trade_result: dict) -> bool:
+    status = str(trade_result.get("status") or "").upper()
+    error  = str(trade_result.get("error") or "")
+    error_low = error.lower()
+
+    non_retryable_statuses = {
+        "BANNED",
+        "NO_CLIENT",
+        "BLOCKED_SYMBOL",
+        "IGNORED_SYMBOL",
+        "RISK_MARGIN_LEVEL",
+        "INVALID_QTY",
+        "NO_POSITION_MARGIN",
+    }
+
+    if status in non_retryable_statuses:
+        return True
+
+    if (
+        "code=-1003" in error
+        or "ip banned" in error_low
+        or "way too much request weight" in error_low
+        or "banned until" in error_low
+    ):
+        return True
+
+    return False
+
+
 def ejecutar_trade_con_retry(
     signal: str,
     ts: pd.Timestamp,
@@ -511,6 +540,10 @@ def ejecutar_trade_con_retry(
     """
     Ejecuta route_signal con retry corto.
     Retorna SIEMPRE un dict canónico.
+
+    Cambios:
+    - NO reintenta si Binance está baneado o si no hay client.
+    - Solo reintenta errores transitorios reales.
     """
     trade_result = {
         "status": "NOT_ATTEMPTED",
@@ -547,6 +580,14 @@ def ejecutar_trade_con_retry(
             if bool(trade_result.get("executed", False)) and trade_result.get("status") == "OK":
                 return trade_result
 
+            if _looks_like_non_retryable_trade_result(trade_result):
+                print(
+                    f"⛔ [TRADE {TRADE_SYMBOL}] stop retry por resultado no-retriable: "
+                    f"status={trade_result.get('status')} error={trade_result.get('error')}",
+                    flush=True
+                )
+                return trade_result
+
         except Exception as e:
             trade_result = {
                 "status": "ERROR",
@@ -555,6 +596,13 @@ def ejecutar_trade_con_retry(
                 "trade_id": None,
             }
             print(f"⚠️ [TRADE {TRADE_SYMBOL}] intento {attempt} excepción: {e}", flush=True)
+
+            if _looks_like_non_retryable_trade_result(trade_result):
+                print(
+                    f"⛔ [TRADE {TRADE_SYMBOL}] stop retry por excepción no-retriable: {e}",
+                    flush=True
+                )
+                return trade_result
 
         if attempt < MAX_ROUTE_RETRIES:
             time.sleep(ROUTE_RETRY_SLEEP_SEC)
